@@ -1,0 +1,31 @@
+# CMake / Visual Studio generated files
+build/
+build-draco/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.dir/
+
+# Native build output and runtime dependencies
+Release/
+Debug/
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.tlog
+
+# Local CAD fixtures and conversion output
+*.step
+*.stp
+*.iges
+*.igs
+*.glb
+*.gltf
+*.bin
