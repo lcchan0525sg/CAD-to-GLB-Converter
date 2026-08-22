@@ -1789,7 +1789,7 @@ void App::convertSelected() {
   job->options = optionsFromControls();
   const std::wstring suffix = job->options.binary ? L".glb" : L".gltf";
   job->output = job->input.parent_path() /
-                (job->input.stem().wstring() + L"-converted" + suffix);
+                (job->input.stem().wstring() + L"-converted" CAD_CONVERTER_OUTPUT_SUFFIX_TEXT + suffix);
   std::wstringstream status;
   const bool nativeStl = lower(job->input.extension().string()) == ".stl" &&
                          job->options.binary && !job->options.draco;

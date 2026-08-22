@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CAD_CONVERTER_VERSION "V0.32" CACHE STRING "Application version label")
+set(CAD_CONVERTER_OUTPUT_SUFFIX "" CACHE STRING "Suffix inserted before converted output extension")
 configure_file(src/version.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/version.hpp" @ONLY)
 
 find_package(OpenCASCADE 8.0.1 REQUIRED
