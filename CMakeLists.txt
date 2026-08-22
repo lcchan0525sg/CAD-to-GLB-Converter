@@ -4,6 +4,9 @@ project(cad_converter2 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(CAD_CONVERTER_VERSION "V0.32" CACHE STRING "Application version label")
+configure_file(src/version.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/version.hpp" @ONLY)
+
 find_package(OpenCASCADE 8.0.1 REQUIRED
   COMPONENTS FoundationClasses ModelingData ModelingAlgorithms Visualization
              ApplicationFramework DataExchange)
@@ -28,6 +31,7 @@ add_executable(cad-converter2 WIN32
 add_dependencies(cad-converter2 gltfpack)
 target_include_directories(cad-converter2 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_BINARY_DIR}/generated
   ${OpenCASCADE_INCLUDE_DIR}
 )
 target_link_directories(cad-converter2 PRIVATE ${OpenCASCADE_LIBRARY_DIR})

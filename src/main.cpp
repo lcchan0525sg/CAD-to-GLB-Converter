@@ -48,6 +48,7 @@
 #include <XCAFDoc_ColorTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 #include "native_stl.hpp"
+#include "version.hpp"
 #include "xcaf_structure.hxx"
 
 #ifndef CAD_CONVERTER_HAS_DRACO
@@ -524,7 +525,7 @@ bool App::createWindow() {
   if (!RegisterClassW(&occtPreviewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
   window_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName,
-                            L"CAD Converter 2 V0.32 - Interactive Preview - OCCT 8.0.1",
+                            L"CAD Converter 2 " CAD_CONVERTER_VERSION_TEXT L" - Interactive Preview - OCCT 8.0.1",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                             1280, 1260, nullptr, nullptr, instance_, nullptr);
   if (!window_) return false;
@@ -562,7 +563,7 @@ void App::createControls() {
     return add(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, width, height, 0);
   };
 
-  headingLabel_ = label(L"CAD Converter 2 V0.32", 44, 24, 500, 34);
+  headingLabel_ = label(L"CAD Converter 2 " CAD_CONVERTER_VERSION_TEXT, 44, 24, 500, 34);
   SendMessageW(headingLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont_), TRUE);
   helpButton_ = add(0, L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT,
                     848, 28, 72, 30, IDC_MANUAL_HELP);
