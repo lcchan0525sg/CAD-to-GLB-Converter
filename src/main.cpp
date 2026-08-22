@@ -6,6 +6,7 @@
 
 #include <AIS_InteractiveContext.hxx>
 #include <AIS_ViewController.hxx>
+#include <Aspect_GradientFillMethod.hxx>
 #include <BRep_Tool.hxx>
 #include <BRep_Builder.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
@@ -589,7 +590,10 @@ void App::initializePreview() {
     if (!previewWindow_->IsMapped()) previewWindow_->Map();
     previewOriginalProc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
         previewPanel_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&App::previewProc)));
-    view_->SetBackgroundColor(Quantity_NOC_BLACK);
+    const Quantity_Color gradientTop(0.92, 0.97, 1.0, Quantity_TOC_RGB);
+    const Quantity_Color gradientBottom(0.68, 0.84, 0.96, Quantity_TOC_RGB);
+    view_->SetBgGradientColors(gradientTop, gradientBottom,
+                               Aspect_GradientFillMethod_Vertical, true);
     view_->SetShadingModel(V3d_PHONG);
     view_->Redraw();
   } catch (const Standard_Failure& failure) {
