@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <GL/gl.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <wrl.h>
@@ -9,9 +10,12 @@
 #include <Aspect_GradientFillMethod.hxx>
 #include <BRep_Tool.hxx>
 #include <BRep_Builder.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <Aspect_DisplayConnection.hxx>
 #include <Graphic3d_GraphicDriver.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
 #include <IGESCAFControl_Reader.hxx>
 #include <Message_ProgressRange.hxx>
 #include <NCollection_IndexedDataMap.hxx>
@@ -25,10 +29,16 @@
 #include <TCollection_AsciiString.hxx>
 #include <TCollection_ExtendedString.hxx>
 #include <TDocStd_Document.hxx>
+#include <TDataStd_Name.hxx>
+#include <TDF_ChildIterator.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Iterator.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <Poly_Triangulation.hxx>
+#include <BRepTools.hxx>
+#include <Bnd_Box.hxx>
+#include <Precision.hxx>
 #include <V3d_View.hxx>
 #include <V3d_Viewer.hxx>
 #include <WNT_Window.hxx>
@@ -38,6 +48,11 @@
 #include <XCAFDoc_ColorTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 #include "native_stl.hpp"
+#include "xcaf_structure.hxx"
+
+#ifndef CAD_CONVERTER_HAS_DRACO
+#define CAD_CONVERTER_HAS_DRACO 0
+#endif
 #include <Quantity_Color.hxx>
 #include <TopoDS_Compound.hxx>
 
@@ -55,6 +70,8 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <set>
+#include <functional>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -124,9 +141,94 @@ static bool readTriangleCount(const fs::path& report, std::uint64_t& triangleCou
   }
 }
 
+static bool readGlbJson(const fs::path& path, std::string& json) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
+  std::uint32_t magic = 0, version = 0, totalLength = 0;
+  std::uint32_t chunkLength = 0, chunkType = 0;
+  file.read(reinterpret_cast<char*>(&magic), 4);
+  file.read(reinterpret_cast<char*>(&version), 4);
+  file.read(reinterpret_cast<char*>(&totalLength), 4);
+  file.read(reinterpret_cast<char*>(&chunkLength), 4);
+  file.read(reinterpret_cast<char*>(&chunkType), 4);
+  if (!file || magic != 0x46546C67 || version != 2 || chunkType != 0x4E4F534A) return false;
+  json.resize(chunkLength);
+  file.read(json.data(), chunkLength);
+  return static_cast<std::uint32_t>(file.gcount()) == chunkLength;
+}
+
+static std::string gltfArray(const std::string& json, const char* key) {
+  const std::size_t keyPosition = json.find(std::string("\"") + key + "\"");
+  if (keyPosition == std::string::npos) return {};
+  const std::size_t open = json.find('[', keyPosition);
+  if (open == std::string::npos) return {};
+  int depth = 0;
+  bool quotedString = false;
+  bool escaped = false;
+  for (std::size_t i = open; i < json.size(); ++i) {
+    const char c = json[i];
+    if (quotedString) {
+      if (escaped) escaped = false;
+      else if (c == '\\') escaped = true;
+      else if (c == '\"') quotedString = false;
+      continue;
+    }
+    if (c == '\"') quotedString = true;
+    else if (c == '[') ++depth;
+    else if (c == ']' && --depth == 0) return json.substr(open + 1, i - open - 1);
+  }
+  return {};
+}
+
+static std::size_t gltfArrayObjectCount(const std::string& array) {
+  std::size_t count = 0;
+  int depth = 0;
+  bool quotedString = false;
+  bool escaped = false;
+  for (char c : array) {
+    if (quotedString) {
+      if (escaped) escaped = false;
+      else if (c == '\\') escaped = true;
+      else if (c == '\"') quotedString = false;
+      continue;
+    }
+    if (c == '\"') quotedString = true;
+    else if (c == '{') { if (depth == 0) ++count; ++depth; }
+    else if (c == '}') --depth;
+  }
+  return count;
+}
+
+static std::set<std::string> gltfNames(const std::string& array) {
+  std::set<std::string> names;
+  std::size_t position = 0;
+  while ((position = array.find("\"name\"", position)) != std::string::npos) {
+    const std::size_t colon = array.find(':', position + 6);
+    const std::size_t firstQuote = colon == std::string::npos ? std::string::npos : array.find('\"', colon + 1);
+    const std::size_t lastQuote = firstQuote == std::string::npos ? std::string::npos : array.find('\"', firstQuote + 1);
+    if (lastQuote == std::string::npos) break;
+    names.insert(array.substr(firstQuote + 1, lastQuote - firstQuote - 1));
+    position = lastQuote + 1;
+  }
+  return names;
+}
+
+static bool validateSceneStructure(const fs::path& source, const fs::path& optimized) {
+  std::string sourceJson, optimizedJson;
+  if (!readGlbJson(source, sourceJson) || !readGlbJson(optimized, optimizedJson)) return false;
+  for (const char* key : {"scenes", "nodes", "meshes"}) {
+    const std::string sourceArray = gltfArray(sourceJson, key);
+    const std::string optimizedArray = gltfArray(optimizedJson, key);
+    if (gltfArrayObjectCount(sourceArray) != gltfArrayObjectCount(optimizedArray)) return false;
+    if (gltfNames(sourceArray) != gltfNames(optimizedArray)) return false;
+  }
+  return true;
+}
+
 static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
                         const ConvertOptions& options, std::uint64_t& outputPolygons,
-                        std::string& error) {
+                        std::string& error, bool allowSimplification = true,
+                        bool preserveSceneStructure = false) {
   const fs::path tool = executableDirectory() / L"gltfpack.exe";
   if (!fs::is_regular_file(tool)) {
     error = "gltfpack.exe is missing beside the converter";
@@ -141,7 +243,7 @@ static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
   double ratio = 1.0;
   double targetError = 0.01;
   bool aggressive = false;
-  if (options.optimize) {
+  if (options.optimize && allowSimplification) {
     if (options.profile == "balanced") { ratio = 0.70; targetError = 0.01; aggressive = true; }
     else if (options.profile == "large") { ratio = 0.50; targetError = 0.02; aggressive = true; }
     else if (options.profile == "preview") { ratio = 0.25; targetError = 0.04; aggressive = true; }
@@ -154,7 +256,7 @@ static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
 
   std::wstringstream command;
   command << quoted(tool) << L" -i " << quoted(rawInput) << L" -o " << quoted(output)
-          << L" -r " << quoted(report) << L" -vp 14 -vn 8";
+          << L" -r " << quoted(report) << L" -kn -km -ke -vp 14 -vn 8";
   if (ratio < 0.999) {
     command << L" -si " << std::fixed << std::setprecision(4) << ratio
             << L" -se " << std::fixed << std::setprecision(4) << targetError
@@ -180,13 +282,47 @@ static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
   const bool counted = readTriangleCount(report, outputPolygons);
+  const bool structureValid = !preserveSceneStructure || validateSceneStructure(rawInput, output);
   fs::remove(report, ignored);
-  if (exitCode != 0 || !fs::is_regular_file(output) || !counted) {
-    error = "meshoptimizer post-process failed";
+  if (exitCode != 0 || !fs::is_regular_file(output) || !counted || !structureValid) {
+    error = structureValid ? "meshoptimizer post-process failed"
+                           : "meshoptimizer changed STEP/IGES assembly structure or names";
     fs::remove(output, ignored);
     return false;
   }
   return true;
+}
+
+struct OcctMeshQuality {
+  double deflection = 0.20;
+  double angular = 0.50;
+  double diagonal = 0.0;
+};
+
+static OcctMeshQuality occtMeshQuality(const std::string& profile,
+                                       double customDeflection,
+                                       double customAngular,
+                                       const NCollection_Sequence<TDF_Label>& roots) {
+  Bnd_Box bounds;
+  for (Standard_Integer i = 1; i <= roots.Length(); ++i) {
+    const TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(roots.Value(i));
+    if (!shape.IsNull()) BRepBndLib::Add(shape, bounds);
+  }
+  if (bounds.IsVoid()) return {customDeflection, customAngular, 0.0};
+  Standard_Real xmin = 0.0, ymin = 0.0, zmin = 0.0;
+  Standard_Real xmax = 0.0, ymax = 0.0, zmax = 0.0;
+  bounds.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+  const double dx = xmax - xmin;
+  const double dy = ymax - ymin;
+  const double dz = zmax - zmin;
+  const double diagonal = std::sqrt(dx * dx + dy * dy + dz * dz);
+  double ratio = 0.0005;
+  double angular = 0.25;
+  if (profile == "balanced") { ratio = 0.0010; angular = 0.45; }
+  else if (profile == "large") { ratio = 0.0025; angular = 0.70; }
+  else if (profile == "preview") { ratio = 0.0050; angular = 1.00; }
+  else if (profile == "custom") return {customDeflection, customAngular, diagonal};
+  return {std::max(diagonal * ratio, Precision::Confusion() * 10.0), angular, diagonal};
 }
 
 enum ControlId {
@@ -200,6 +336,7 @@ enum ControlId {
   IDC_PROFILE,
   IDC_DEFLECTION,
   IDC_ANGULAR,
+  IDC_MANUAL_HELP,
 };
 
 class App {
@@ -218,9 +355,13 @@ private:
   void initializeNativePreview();
   void renderNativePreviewSoftware();
   void renderNativePreviewHardware();
+  void showNativePreviewGeometry(const std::vector<native_stl::Triangle>& triangles);
   void showNativePreview(const std::vector<native_stl::Triangle>& triangles);
+  std::vector<native_stl::Triangle> collectDocumentTriangles(const Handle(TDocStd_Document)& document) const;
   void resizePreview();
   void showPreview(const Handle(TDocStd_Document)& document);
+  void populateAssemblyTree(const Handle(TDocStd_Document)& document);
+  void clearAssemblyTree();
   bool handlePreviewMessage(HWND, UINT, WPARAM, LPARAM);
   bool handleNativePreviewMessage(HWND, UINT, WPARAM, LPARAM);
   bool paintBackground(HDC);
@@ -232,13 +373,15 @@ private:
   void applyProfileValues();
   void handleCommand(WPARAM wParam);
   void chooseInput();
+  void openHelp();
   void selectInputPath(const fs::path& path);
   void handleDropFiles(HDROP drop);
   void convertSelected();
   void updateConversionInfo(const fs::path& input, const fs::path& output,
                             const ConvertOptions& options,
                             const Handle(TDocStd_Document)& document,
-                            std::uint64_t outputPolygonOverride = 0);
+                            std::uint64_t outputPolygonOverride = 0,
+                            std::uint64_t inputPolygonOverride = 0);
   ConvertOptions optionsFromControls() const;
   bool convertCad(const fs::path& input, const fs::path& output, const ConvertOptions& options,
                   std::string& error);
@@ -256,12 +399,14 @@ private:
   HWND angularEdit_{};
   HWND selectButton_{};
   HWND convertButton_{};
+  HWND helpButton_{};
   HWND qualityHelp_{};
   HWND statusLabel_{};
   HWND outputFileLabel_{};
   HWND processingTimeLabel_{};
   HWND conversionInfoHeader_{};
-  std::array<HWND, 8> conversionStats_{};
+  std::array<HWND, 9> conversionStats_{};
+  HWND assemblyTree_{};
   HWND previewPanel_{};
   HWND nativePreviewPanel_{};
   HWND headingLabel_{};
@@ -337,12 +482,22 @@ bool App::createWindow() {
   nativePreviewClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   nativePreviewClass.hbrBackground = nullptr;
   if (!RegisterClassW(&nativePreviewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+  WNDCLASSW occtPreviewClass{};
+  occtPreviewClass.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+  occtPreviewClass.lpfnWndProc = &App::previewProc;
+  occtPreviewClass.hInstance = instance_;
+  occtPreviewClass.lpszClassName = L"CadOcctPreviewWindow";
+  occtPreviewClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  occtPreviewClass.hbrBackground = nullptr;
+  if (!RegisterClassW(&occtPreviewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
   window_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName,
-                            L"CAD Converter 2 V0.3 - Interactive Preview - OCCT 8.0.1",
+                            L"CAD Converter 2 V0.31 - Interactive Preview - OCCT 8.0.1",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
-                            980, 1260, nullptr, nullptr, instance_, nullptr);
+                            1280, 1260, nullptr, nullptr, instance_, nullptr);
   if (!window_) return false;
+  INITCOMMONCONTROLSEX commonControls{sizeof(commonControls), ICC_TREEVIEW_CLASSES};
+  InitCommonControlsEx(&commonControls);
   DragAcceptFiles(window_, TRUE);
   createControls();
   ShowWindow(window_, SW_SHOW);
@@ -375,8 +530,11 @@ void App::createControls() {
     return add(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, width, height, 0);
   };
 
-  headingLabel_ = label(L"CAD Converter 2 V0.3", 44, 24, 500, 34);
+  headingLabel_ = label(L"CAD Converter 2 V0.31", 44, 24, 500, 34);
   SendMessageW(headingLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont_), TRUE);
+  helpButton_ = add(0, L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT,
+                    848, 28, 72, 30, IDC_MANUAL_HELP);
+  SendMessageW(helpButton_, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont_), TRUE);
   subtitleLabel_ = label(L"Native CAD conversion with Draco and Meshopt GLB export", 44, 62, 700, 24);
   selectButton_ = add(0, L"BUTTON", L"Drop a CAD file here or click to browse",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
@@ -408,8 +566,12 @@ void App::createControls() {
   compressCombo_ = add(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
                        478, 330, 160, 180, IDC_COMPRESS);
   SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"none"));
+#if CAD_CONVERTER_HAS_DRACO
   SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Draco"));
-  SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Meshopt (STL)"));
+#else
+  SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Draco (Draco build required)"));
+#endif
+  SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Meshopt (STL only)"));
   SendMessageW(compressCombo_, CB_SETCURSEL, 0, 0);
 
   label(L"Level", 648, 306, 100, 22);
@@ -441,30 +603,37 @@ void App::createControls() {
                      728, 410, 84, 32, IDC_ANGULAR);
 
   qualityHelp_ = label(L"Large assembly: 1.00 deflection / 1.00 angular. Fewer triangles and faster browser interaction.",
-                       48, 458, 850, 42);
+                       48, 458, 1160, 42);
   statusLabel_ = label(L"Ready. Select a STEP or IGES file.", 48, 500, 850, 24);
-  outputFileLabel_ = label(L"", 48, 526, 850, 24);
-  processingTimeLabel_ = label(L"", 48, 552, 850, 24);
+  outputFileLabel_ = label(L"", 48, 526, 1160, 24);
+  processingTimeLabel_ = label(L"", 48, 552, 1160, 24);
   ShowWindow(outputFileLabel_, SW_HIDE);
   ShowWindow(processingTimeLabel_, SW_HIDE);
-  conversionInfoHeader_ = label(L"CONVERSION INFORMATION", 48, 584, 850, 28);
-  const int statX[] = {48, 264, 480, 696};
-  const wchar_t* statTitles[] = {L"INPUT", L"OUTPUT", L"COMPRESSION", L"MESH QUALITY",
-                                 L"SIZE SAVED", L"MESHES", L"FACES", L"OUTPUT POLYGONS"};
-  for (int i = 0; i < 8; ++i) {
-    const int row = i / 4;
-    conversionStats_[i] = label(statTitles[i], statX[i % 4], 618 + row * 58, 194, 48);
+  conversionInfoHeader_ = label(L"CONVERSION INFORMATION", 48, 584, 1160, 28);
+  const int statX[] = {48, 292, 536, 780, 1024};
+  const wchar_t* statTitles[] = {L"INPUT", L"OUTPUT", L"COMPRESSION", L"MESH QUALITY", L"PARTS",
+                                 L"ORIGINAL B-REP FACES", L"RESULT MESH FACES", L"FACE REDUCTION", L"SIZE SAVED"};
+  for (int i = 0; i < 9; ++i) {
+    const int row = i / 5;
+    const int column = i % 5;
+    conversionStats_[i] = label(statTitles[i], statX[column], 618 + row * 58, 220, 48);
     ShowWindow(conversionStats_[i], SW_HIDE);
   }
   ShowWindow(conversionInfoHeader_, SW_HIDE);
-  label(L"3D Preview", 44, 768, 500, 28);
-  previewPanel_ = add(WS_EX_CLIENTEDGE, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | SS_BLACKRECT | SS_NOTIFY,
-                       44, 804, 892, 390, 0);
+  label(L"ASSEMBLY TREE", 44, 768, 280, 28);
+  assemblyTree_ = add(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASBUTTONS |
+                          TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS,
+                      44, 804, 280, 390, 0);
+  label(L"3D Preview", 340, 768, 896, 28);
+  previewPanel_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"CadOcctPreviewWindow", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                  340, 804, 896, 390, window_, nullptr, instance_, nullptr);
   nativePreviewPanel_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"CadNativePreviewWindow", L"",
                                         WS_CHILD | WS_TABSTOP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-                                        44, 804, 892, 390, window_, nullptr, instance_, nullptr);
+                                        340, 804, 896, 390, window_, nullptr, instance_, nullptr);
   ShowWindow(nativePreviewPanel_, SW_HIDE);
-  label(L"Left drag: rotate  |  Middle drag: pan  |  Wheel: zoom", 44, 1204, 892, 24);
+  label(L"Left drag: rotate  |  Middle drag: pan  |  Wheel: zoom", 340, 1204, 896, 24);
   updateOptionState();
   initializePreview();
 }
@@ -653,10 +822,8 @@ void App::renderNativePreviewHardware() {
   nativePreviewLastRenderTick_ = GetTickCount64();
 }
 
-void App::showNativePreview(const std::vector<native_stl::Triangle>& triangles) {
+void App::showNativePreviewGeometry(const std::vector<native_stl::Triangle>& triangles) {
   ShowWindow(previewPanel_, SW_HIDE);
-  SetWindowPos(nativePreviewPanel_, HWND_TOP, 0, 0, 0, 0,
-               SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
   nativePreviewTriangles_ = triangles;
   nativePreviewActive_ = true;
   nativePreviewYaw_ = 35.0f;
@@ -664,7 +831,23 @@ void App::showNativePreview(const std::vector<native_stl::Triangle>& triangles) 
   nativePreviewZoom_ = 1.0f;
   nativePreviewPanX_ = 0.0f;
   nativePreviewPanY_ = 0.0f;
+  SetWindowPos(nativePreviewPanel_, HWND_TOP, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+  InvalidateRect(nativePreviewPanel_, nullptr, FALSE);
+  UpdateWindow(nativePreviewPanel_);
   renderNativePreviewHardware();
+}
+
+void App::showNativePreview(const std::vector<native_stl::Triangle>& triangles) {
+  clearAssemblyTree();
+  std::wstring treeText = L"STL mesh (" + std::to_wstring(triangles.size()) + L" faces)";
+  TVINSERTSTRUCTW treeItem{};
+  treeItem.hParent = TVI_ROOT;
+  treeItem.hInsertAfter = TVI_LAST;
+  treeItem.item.mask = TVIF_TEXT;
+  treeItem.item.pszText = const_cast<LPWSTR>(treeText.c_str());
+  TreeView_InsertItem(assemblyTree_, &treeItem);
+  showNativePreviewGeometry(triangles);
 }
 
 void App::initializePreview() {
@@ -681,8 +864,7 @@ void App::initializePreview() {
     previewWindow_ = new WNT_Window(reinterpret_cast<Aspect_Handle>(previewPanel_));
     view_->SetWindow(previewWindow_);
     if (!previewWindow_->IsMapped()) previewWindow_->Map();
-    previewOriginalProc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
-        previewPanel_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&App::previewProc)));
+    previewOriginalProc_ = nullptr;
     const Quantity_Color gradientTop(0.92, 0.97, 1.0, Quantity_TOC_RGB);
     const Quantity_Color gradientBottom(0.68, 0.84, 0.96, Quantity_TOC_RGB);
     view_->SetBgGradientColors(gradientTop, gradientBottom,
@@ -705,10 +887,116 @@ void App::resizePreview() {
   }
 }
 
+void App::clearAssemblyTree() {
+  if (assemblyTree_) TreeView_DeleteAllItems(assemblyTree_);
+}
+
+void App::populateAssemblyTree(const Handle(TDocStd_Document)& document) {
+  clearAssemblyTree();
+  if (document.IsNull()) return;
+  const Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(document->Main());
+  NCollection_Sequence<TDF_Label> roots;
+  shapeTool->GetFreeShapes(roots);
+  auto insertText = [&](const std::wstring& text, HTREEITEM parent) {
+    TVINSERTSTRUCTW item{};
+    item.hParent = parent;
+    item.hInsertAfter = TVI_LAST;
+    item.item.mask = TVIF_TEXT;
+    item.item.pszText = const_cast<LPWSTR>(text.c_str());
+    return TreeView_InsertItem(assemblyTree_, &item);
+  };
+  auto fallbackPartName = [](int index) {
+    std::wstringstream name;
+    name << L"Part " << std::setfill(L'0') << std::setw(3) << index;
+    return name.str();
+  };
+  std::function<HTREEITEM(const TDF_Label&, HTREEITEM, int, bool)> insertLabel;
+  insertLabel = [&](const TDF_Label& label, HTREEITEM parent, int fallbackIndex,
+                    bool allowShapeFallback) -> HTREEITEM {
+    std::wstring text = xcaf_structure::labelName(label);
+    TDF_Label referred;
+    if (xcaf_structure::isPlaceholderName(text) &&
+        XCAFDoc_ShapeTool::GetReferredShape(label, referred)) {
+      text = xcaf_structure::labelName(referred);
+    }
+    if (xcaf_structure::isPlaceholderName(text)) text = fallbackPartName(fallbackIndex);
+    const HTREEITEM treeItem = insertText(text, parent);
+
+    const TDF_Label structureLabel = referred.IsNull() ? label : referred;
+    NCollection_Sequence<TDF_Label> components;
+    if (XCAFDoc_ShapeTool::GetComponents(structureLabel, components, false)) {
+      for (Standard_Integer index = 1; index <= components.Length(); ++index) {
+        insertLabel(components.Value(index), treeItem, index, false);
+      }
+    } else if (allowShapeFallback) {
+      const TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(label);
+      int childIndex = 1;
+      for (TopoDS_Iterator children(shape); children.More(); children.Next()) {
+        insertText(fallbackPartName(childIndex++), treeItem);
+      }
+    }
+    return treeItem;
+  };
+  for (Standard_Integer i = 1; i <= roots.Length(); ++i) {
+    insertLabel(roots.Value(i), TVI_ROOT, i, true);
+  }
+  if (roots.Length() > 0) {
+    TreeView_Expand(assemblyTree_, TreeView_GetRoot(assemblyTree_), TVE_EXPAND);
+  }
+}
+
+std::vector<native_stl::Triangle> App::collectDocumentTriangles(
+    const Handle(TDocStd_Document)& document) const {
+  std::vector<native_stl::Triangle> triangles;
+  if (document.IsNull()) return triangles;
+  const Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(document->Main());
+  NCollection_Sequence<TDF_Label> roots;
+  shapeTool->GetFreeShapes(roots);
+  for (Standard_Integer rootIndex = 1; rootIndex <= roots.Length(); ++rootIndex) {
+    const TopoDS_Shape rootShape = XCAFDoc_ShapeTool::GetShape(roots.Value(rootIndex));
+    for (TopExp_Explorer faces(rootShape, TopAbs_FACE); faces.More(); faces.Next()) {
+      TopLoc_Location location;
+      const Handle(Poly_Triangulation) triangulation =
+          BRep_Tool::Triangulation(TopoDS::Face(faces.Current()), location);
+      if (triangulation.IsNull()) continue;
+      for (Standard_Integer triangleIndex = 1;
+           triangleIndex <= triangulation->NbTriangles(); ++triangleIndex) {
+        int n1 = 0, n2 = 0, n3 = 0;
+        triangulation->Triangle(triangleIndex).Get(n1, n2, n3);
+        const gp_Pnt p1 = triangulation->Node(n1).Transformed(location.Transformation());
+        const gp_Pnt p2 = triangulation->Node(n2).Transformed(location.Transformation());
+        const gp_Pnt p3 = triangulation->Node(n3).Transformed(location.Transformation());
+        const gp_Vec normal = gp_Vec(p1, p2).Crossed(gp_Vec(p1, p3));
+        if (normal.SquareMagnitude() <= Precision::Confusion()) continue;
+        const double length = std::sqrt(normal.SquareMagnitude());
+        native_stl::Triangle result{};
+        result.normal[0] = static_cast<float>(normal.X() / length);
+        result.normal[1] = static_cast<float>(normal.Y() / length);
+        result.normal[2] = static_cast<float>(normal.Z() / length);
+        const gp_Pnt points[] = {p1, p2, p3};
+        for (int pointIndex = 0; pointIndex < 3; ++pointIndex) {
+          result.vertices[pointIndex * 3] = static_cast<float>(points[pointIndex].X());
+          result.vertices[pointIndex * 3 + 1] = static_cast<float>(points[pointIndex].Y());
+          result.vertices[pointIndex * 3 + 2] = static_cast<float>(points[pointIndex].Z());
+        }
+        triangles.push_back(result);
+      }
+    }
+  }
+  return triangles;
+}
+
 void App::showPreview(const Handle(TDocStd_Document)& document) {
   nativePreviewActive_ = false;
   ShowWindow(nativePreviewPanel_, SW_HIDE);
-  ShowWindow(previewPanel_, SW_SHOW);
+  SetWindowPos(previewPanel_, HWND_TOP, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+  populateAssemblyTree(document);
+  const std::vector<native_stl::Triangle> previewTriangles = collectDocumentTriangles(document);
+  if (!previewTriangles.empty()) {
+    showNativePreviewGeometry(previewTriangles);
+    return;
+  }
   if (previewContext_.IsNull() || view_.IsNull()) return;
   previewContext_->RemoveAll(false);
   previewObjects_.clear();
@@ -723,8 +1011,11 @@ void App::showPreview(const Handle(TDocStd_Document)& document) {
     previewContext_->Display(object, false);
   }
   if (!previewObjects_.empty()) {
+    view_->MustBeResized();
     view_->FitAll(0.01, false);
     view_->Redraw();
+    InvalidateRect(previewPanel_, nullptr, FALSE);
+    UpdateWindow(previewPanel_);
   }
 }
 
@@ -893,13 +1184,13 @@ bool App::paintBackground(HDC dc) {
     HPEN statsBorderPen = CreatePen(PS_SOLID, 1, RGB(213, 221, 232));
     HGDIOBJ oldStatsBrush = SelectObject(dc, statsCardBrush);
     HGDIOBJ oldStatsPen = SelectObject(dc, statsBorderPen);
-    const int statX[] = {48, 264, 480, 696};
-    for (int row = 0; row < 2; ++row) {
-      for (int column = 0; column < 4; ++column) {
-        const int x = statX[column];
-        const int y = 608 + row * 58;
-        RoundRect(dc, x, y, x + 194, y + 52, 8, 8);
-      }
+    const int statX[] = {48, 292, 536, 780, 1024};
+    for (int i = 0; i < 9; ++i) {
+      const int row = i / 5;
+      const int column = i % 5;
+      const int x = statX[column];
+      const int y = 608 + row * 58;
+      RoundRect(dc, x, y, x + 220, y + 52, 8, 8);
     }
     SelectObject(dc, oldStatsPen);
     SelectObject(dc, oldStatsBrush);
@@ -1076,6 +1367,17 @@ void App::updateOptionState() {
     else if (profile == 2) help = L"STL CAD faithful: cleanup, weld, and quantize without polygon simplification.";
     else if (profile == 3) help = L"STL fast preview: cleanup, weld, quantize, and target 25% polygons.";
     else help = L"STL custom: deflection controls reduction ratio; angular controls simplification error.";
+  } else if (!selectedInput_.empty()) {
+    const std::string extension = lower(selectedInput_.extension().string());
+    const bool stepOrIges = extension == ".step" || extension == ".stp" ||
+                            extension == ".igs" || extension == ".iges";
+    if (stepOrIges && optimize) {
+      if (profile == 0) help = L"Large assembly: scale-aware 0.25% deflection / 0.70 angular. Fewer triangles and faster browser interaction.";
+      else if (profile == 1) help = L"Viewer balanced: scale-aware 0.10% deflection / 0.45 angular.";
+      else if (profile == 2) help = L"CAD faithful: scale-aware 0.05% deflection / 0.25 angular. Highest detail.";
+      else if (profile == 3) help = L"Fast preview: scale-aware 0.50% deflection / 1.00 angular.";
+      else help = L"Custom STEP/IGES: absolute deflection and angular tolerance are used.";
+    }
   }
   SetWindowTextW(qualityHelp_, help);
 }
@@ -1085,6 +1387,7 @@ void App::handleCommand(WPARAM wParam) {
   const int code = HIWORD(wParam);
   if (id == IDC_SELECT && code == BN_CLICKED) chooseInput();
   else if (id == IDC_CONVERT && code == BN_CLICKED) convertSelected();
+  else if (id == IDC_MANUAL_HELP && code == BN_CLICKED) openHelp();
   else if (id == IDC_PROFILE && code == CBN_SELCHANGE) { applyProfileValues(); updateOptionState(); }
   else if ((id == IDC_FORMAT || id == IDC_COMPRESS || id == IDC_OPTIMIZE) &&
            (code == CBN_SELCHANGE || code == BN_CLICKED)) updateOptionState();
@@ -1108,6 +1411,21 @@ void App::chooseInput() {
   const fs::path selectedPath(path);
   CoTaskMemFree(path);
   selectInputPath(selectedPath);
+}
+
+void App::openHelp() {
+  const fs::path manual = executableDirectory() / L"docs" / L"CAD-Converter-2-V0.31-User-Manual.pdf";
+  if (!fs::is_regular_file(manual)) {
+    MessageBoxW(window_, L"The V0.31 user manual was not found in the docs folder.",
+                L"CAD Converter 2 Help", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  const HINSTANCE result = ShellExecuteW(window_, L"open", manual.c_str(), nullptr,
+                                         manual.parent_path().c_str(), SW_SHOWNORMAL);
+  if (reinterpret_cast<INT_PTR>(result) <= 32) {
+    MessageBoxW(window_, L"Windows could not open the PDF manual.",
+                L"CAD Converter 2 Help", MB_OK | MB_ICONERROR);
+  }
 }
 
 void App::selectInputPath(const fs::path& path) {
@@ -1153,7 +1471,8 @@ void App::handleDropFiles(HDROP drop) {
 void App::updateConversionInfo(const fs::path& input, const fs::path& output,
                                const ConvertOptions& options,
                                const Handle(TDocStd_Document)& document,
-                               std::uint64_t outputPolygonOverride) {
+                               std::uint64_t outputPolygonOverride,
+                               std::uint64_t inputPolygonOverride) {
   std::error_code inputError;
   std::error_code outputError;
   const std::uintmax_t inputBytes = fs::file_size(input, inputError);
@@ -1165,6 +1484,7 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
     return text.str();
   };
 
+  const bool isStl = lower(input.extension().string()) == ".stl";
   std::uint64_t meshCount = 0;
   const Handle(XCAFDoc_ShapeTool) shapeTool = document.IsNull()
       ? Handle(XCAFDoc_ShapeTool)()
@@ -1172,15 +1492,17 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
   NCollection_Sequence<TDF_Label> roots;
   if (!shapeTool.IsNull()) {
     shapeTool->GetFreeShapes(roots);
-    meshCount = roots.Length();
+    const xcaf_structure::Summary structure = xcaf_structure::summarize(document);
+    meshCount = structure.componentCount > 0
+        ? structure.componentCount : structure.rootCount;
   }
-  std::uint64_t faceCount = 0;
+  std::uint64_t cadFaceCount = 0;
   std::uint64_t triangleCount = 0;
   if (!shapeTool.IsNull()) {
     for (Standard_Integer i = 1; i <= roots.Length(); ++i) {
       const TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(roots.Value(i));
       for (TopExp_Explorer faces(shape, TopAbs_FACE); faces.More(); faces.Next()) {
-        ++faceCount;
+        ++cadFaceCount;
         TopLoc_Location location;
         const Handle(Poly_Triangulation) triangulation =
             BRep_Tool::Triangulation(TopoDS::Face(faces.Current()), location);
@@ -1188,14 +1510,16 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
       }
     }
   }
+  const std::uint64_t generatedPolygonCount = triangleCount;
+  const std::uint64_t originalMeshFaceCount = inputPolygonOverride != 0
+      ? inputPolygonOverride : generatedPolygonCount;
+  const std::uint64_t originalFaceCount = isStl ? originalMeshFaceCount : cadFaceCount;
   if (outputPolygonOverride != 0) {
     meshCount = meshCount == 0 ? 1 : meshCount;
-    faceCount = faceCount == 0 ? outputPolygonOverride : faceCount;
     triangleCount = outputPolygonOverride;
   }
 
   std::wstringstream quality;
-  const bool isStl = lower(input.extension().string()) == ".stl";
   const wchar_t* profileName = options.profile == "large" ? L"large" :
                                options.profile == "balanced" ? L"balanced" :
                                options.profile == "preview" ? L"preview" :
@@ -1210,8 +1534,25 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
     quality << (options.optimize ? L"optimized profile=" : L"preserved profile=") << profileName
             << L"\r\ntarget=" << targetPercent << L"% polygons";
   } else {
+    double reportedDeflection = options.deflection;
+    double reportedAngular = options.angular;
+    if (options.optimize && !document.IsNull()) {
+      const OcctMeshQuality actual = occtMeshQuality(options.profile, options.deflection,
+                                                      options.angular, roots);
+      reportedDeflection = actual.deflection;
+      reportedAngular = actual.angular;
+    }
     quality << (options.optimize ? L"optimized profile=" : L"faithful profile=") << profileName
-            << L"\r\ndeflection=" << options.deflection << L" angular=" << options.angular;
+            << L"\r\ndeflection=" << reportedDeflection << L" angular=" << reportedAngular;
+  }
+
+  std::wstringstream reduction;
+  if (isStl && originalMeshFaceCount > 0) {
+    const double percent = (1.0 - static_cast<double>(triangleCount) /
+                                      static_cast<double>(originalMeshFaceCount)) * 100.0;
+    reduction << std::fixed << std::setprecision(1) << percent << L"%";
+  } else {
+    reduction << L"n/a (CAD face to mesh face)";
   }
 
   std::wstringstream saved;
@@ -1229,10 +1570,12 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
       L"COMPRESSION\r\n" + (options.draco ? L"Draco level " + std::to_wstring(options.dracoLevel) :
                                 options.meshopt ? L"Meshopt" : L"none"),
       L"MESH QUALITY\r\n" + quality.str(),
+      L"PARTS\r\n" + std::to_wstring(meshCount),
+      (isStl ? L"ORIGINAL MESH FACES\r\n" : L"ORIGINAL B-REP FACES\r\n") +
+          (originalFaceCount > 0 ? std::to_wstring(originalFaceCount) : L"n/a"),
+      L"RESULT MESH FACES\r\n" + std::to_wstring(triangleCount),
+      L"FACE REDUCTION\r\n" + reduction.str(),
       L"SIZE SAVED\r\n" + saved.str(),
-      L"MESHES\r\n" + std::to_wstring(meshCount),
-      L"FACES\r\n" + std::to_wstring(faceCount),
-      L"OUTPUT POLYGONS\r\n" + std::to_wstring(triangleCount),
   };
   ShowWindow(conversionInfoHeader_, SW_SHOW);
   for (std::size_t i = 0; i < conversionStats_.size(); ++i) {
@@ -1244,10 +1587,18 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
 
 bool App::convertCad(const fs::path& input, const fs::path& output, const ConvertOptions& options,
                      std::string& error) {
+  const std::string extension = lower(input.extension().string());
+  if (options.draco && !CAD_CONVERTER_HAS_DRACO) {
+    error = "Draco compression requires the Draco-enabled build";
+    return false;
+  }
+  if (options.meshopt && extension != ".stl") {
+    error = "Meshopt compression is available for STL only; use none or Draco for STEP/IGES to preserve assembly structure";
+    return false;
+  }
   Handle(TDocStd_Document) document;
   XCAFApp_Application::GetApplication()->NewDocument(TCollection_ExtendedString("MDTV-XCAF"), document);
 
-  const std::string extension = lower(input.extension().string());
   if (extension == ".step" || extension == ".stp") {
     STEPCAFControl_Reader reader;
     reader.SetColorMode(true);
@@ -1264,10 +1615,12 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
       error = "OCCT 8.0.1 IGES Perform failed";
       return false;
     }
+    xcaf_structure::normalizeIgesAssembly(document, input.stem().wstring());
   } else if (extension == ".stl") {
     if (options.binary && !options.draco) {
       try {
         std::vector<native_stl::Triangle> triangles = native_stl::read(input);
+        const std::uint64_t inputPolygonCount = triangles.size();
         if (options.optimize) triangles = native_stl::cleanup(triangles);
         std::uint64_t outputPolygons = triangles.size();
         const bool postProcess = options.optimize || options.meshopt;
@@ -1283,7 +1636,7 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
           std::error_code ignored;
           fs::remove(rawOutput, ignored);
         }
-        updateConversionInfo(input, output, options, document, outputPolygons);
+        updateConversionInfo(input, output, options, document, outputPolygons, inputPolygonCount);
         showNativePreview(triangles);
         return true;
       } catch (const std::exception& exception) {
@@ -1315,11 +1668,21 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
   const Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(document->Main());
   NCollection_Sequence<TDF_Label> roots;
   shapeTool->GetFreeShapes(roots);
+  double meshDeflection = options.deflection;
+  double meshAngular = options.angular;
+  if (options.optimize && (extension == ".step" || extension == ".stp" ||
+                           extension == ".igs" || extension == ".iges")) {
+    const OcctMeshQuality quality = occtMeshQuality(options.profile, options.deflection,
+                                                    options.angular, roots);
+    meshDeflection = quality.deflection;
+    meshAngular = quality.angular;
+  }
   for (Standard_Integer i = 1; i <= roots.Length(); ++i) {
     TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(roots.Value(i));
     if (!shape.IsNull()) {
-      BRepMesh_IncrementalMesh mesh(shape, options.deflection, Standard_False,
-                                     options.angular, Standard_True);
+      BRepTools::Clean(shape);
+      BRepMesh_IncrementalMesh mesh(shape, meshDeflection, Standard_False,
+                                     meshAngular, Standard_True);
       if (!mesh.IsDone()) {
         error = "OCCT triangulation failed";
         return false;
@@ -1339,6 +1702,10 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
   NCollection_IndexedDataMap<TCollection_AsciiString, TCollection_AsciiString> metadata;
   if (!writer.Perform(document, metadata, Message_ProgressRange())) {
     error = "OCCT 8.0.1 GLB export failed";
+    return false;
+  }
+  if ((extension == ".igs" || extension == ".iges") &&
+      !xcaf_structure::renameFallbackGltfNodes(output, error)) {
     return false;
   }
   updateConversionInfo(input, output, options, document);
