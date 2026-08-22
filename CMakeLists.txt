@@ -19,11 +19,19 @@ target_link_directories(cad-converter2 PRIVATE ${OpenCASCADE_LIBRARY_DIR})
 target_link_libraries(cad-converter2 PRIVATE
   ${OpenCASCADE_LIBRARIES}
   ole32
+  opengl32
   shell32
   uuid
 )
 target_compile_definitions(cad-converter2 PRIVATE UNICODE _UNICODE NOMINMAX)
 target_compile_options(cad-converter2 PRIVATE /EHsc)
+
+add_executable(stl-benchmark bench/stl_benchmark.cpp)
+target_include_directories(stl-benchmark PRIVATE ${OpenCASCADE_INCLUDE_DIR})
+target_link_directories(stl-benchmark PRIVATE ${OpenCASCADE_LIBRARY_DIR})
+target_link_libraries(stl-benchmark PRIVATE ${OpenCASCADE_LIBRARIES})
+target_compile_definitions(stl-benchmark PRIVATE NOMINMAX)
+target_compile_options(stl-benchmark PRIVATE /EHsc)
 
 add_custom_command(TARGET cad-converter2 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
