@@ -1,12 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace native_stl {
@@ -71,6 +75,32 @@ inline std::vector<Triangle> read(const fs::path& input) {
   }
   if (triangles.empty()) throw std::runtime_error("no triangles found in STL");
   return triangles;
+}
+
+inline std::vector<Triangle> cleanup(const std::vector<Triangle>& triangles) {
+  std::vector<Triangle> result;
+  result.reserve(triangles.size());
+  std::unordered_set<std::string> seen;
+  seen.reserve(triangles.size());
+  for (const Triangle& triangle : triangles) {
+    const float* a = triangle.vertices;
+    const float* b = triangle.vertices + 3;
+    const float* c = triangle.vertices + 6;
+    const float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    const float cx = uy * vz - uz * vy;
+    const float cy = uz * vx - ux * vz;
+    const float cz = ux * vy - uy * vx;
+    if (cx * cx + cy * cy + cz * cz <= 1.0e-20f) continue;
+
+    std::array<std::array<float, 3>, 3> sorted{{
+        {{a[0], a[1], a[2]}}, {{b[0], b[1], b[2]}}, {{c[0], c[1], c[2]}}}};
+    std::sort(sorted.begin(), sorted.end());
+    const std::string key(reinterpret_cast<const char*>(sorted.data()), sizeof(sorted));
+    if (!seen.insert(key).second) continue;
+    result.push_back(triangle);
+  }
+  return result;
 }
 
 inline std::uint32_t padded(std::uint32_t value) { return (value + 3u) & ~3u; }

@@ -64,6 +64,7 @@ struct ConvertOptions {
   bool binary = true;
   bool colorsOnly = true;
   bool draco = false;
+  bool meshopt = false;
   int dracoLevel = 7;
   bool optimize = true;
   std::string profile = "large";
@@ -95,6 +96,97 @@ static void writeNumber(HWND control, double value) {
   wchar_t text[32]{};
   swprintf_s(text, L"%.2f", value);
   SetWindowTextW(control, text);
+}
+
+static fs::path executableDirectory() {
+  std::vector<wchar_t> buffer(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+  return length == 0 ? fs::current_path() : fs::path(std::wstring(buffer.data(), length)).parent_path();
+}
+
+static std::wstring quoted(const fs::path& path) {
+  return L"\"" + path.wstring() + L"\"";
+}
+
+static bool readTriangleCount(const fs::path& report, std::uint64_t& triangleCount) {
+  std::ifstream file(report);
+  if (!file) return false;
+  const std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  const std::size_t key = content.find("\"triangleCount\"");
+  if (key == std::string::npos) return false;
+  const std::size_t colon = content.find(':', key);
+  if (colon == std::string::npos) return false;
+  try {
+    triangleCount = std::stoull(content.substr(colon + 1));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
+                        const ConvertOptions& options, std::uint64_t& outputPolygons,
+                        std::string& error) {
+  const fs::path tool = executableDirectory() / L"gltfpack.exe";
+  if (!fs::is_regular_file(tool)) {
+    error = "gltfpack.exe is missing beside the converter";
+    return false;
+  }
+  fs::path report = output;
+  report += L".meshopt-report.json";
+  std::error_code ignored;
+  fs::remove(output, ignored);
+  fs::remove(report, ignored);
+
+  double ratio = 1.0;
+  double targetError = 0.01;
+  bool aggressive = false;
+  if (options.optimize) {
+    if (options.profile == "balanced") { ratio = 0.70; targetError = 0.01; aggressive = true; }
+    else if (options.profile == "large") { ratio = 0.50; targetError = 0.02; aggressive = true; }
+    else if (options.profile == "preview") { ratio = 0.25; targetError = 0.04; aggressive = true; }
+    else if (options.profile == "custom") {
+      ratio = clampDouble(1.0 / std::max(1.0, options.deflection), 0.10, 1.0, 1.0);
+      targetError = clampDouble(options.angular / 100.0, 0.001, 0.05, 0.01);
+      aggressive = ratio < 0.999;
+    }
+  }
+
+  std::wstringstream command;
+  command << quoted(tool) << L" -i " << quoted(rawInput) << L" -o " << quoted(output)
+          << L" -r " << quoted(report) << L" -vp 14 -vn 8";
+  if (ratio < 0.999) {
+    command << L" -si " << std::fixed << std::setprecision(4) << ratio
+            << L" -se " << std::fixed << std::setprecision(4) << targetError
+            << L" -sp";
+    if (aggressive) command << L" -sa";
+  }
+  if (options.meshopt) command << L" -c";
+
+  std::wstring mutableCommand = command.str();
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  const BOOL started = CreateProcessW(tool.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+                                      CREATE_NO_WINDOW, nullptr, executableDirectory().c_str(),
+                                      &startup, &process);
+  if (!started) {
+    error = "failed to start gltfpack.exe";
+    return false;
+  }
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exitCode = 1;
+  GetExitCodeProcess(process.hProcess, &exitCode);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  const bool counted = readTriangleCount(report, outputPolygons);
+  fs::remove(report, ignored);
+  if (exitCode != 0 || !fs::is_regular_file(output) || !counted) {
+    error = "meshoptimizer post-process failed";
+    fs::remove(output, ignored);
+    return false;
+  }
+  return true;
 }
 
 enum ControlId {
@@ -247,7 +339,7 @@ bool App::createWindow() {
   if (!RegisterClassW(&nativePreviewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
   window_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName,
-                            L"CAD Converter 2 - Interactive Preview - OCCT 8.0.1",
+                            L"CAD Converter 2 V0.3 - Interactive Preview - OCCT 8.0.1",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                             980, 1260, nullptr, nullptr, instance_, nullptr);
   if (!window_) return false;
@@ -283,9 +375,9 @@ void App::createControls() {
     return add(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, width, height, 0);
   };
 
-  headingLabel_ = label(L"CAD Converter 2", 44, 24, 500, 34);
+  headingLabel_ = label(L"CAD Converter 2 V0.3", 44, 24, 500, 34);
   SendMessageW(headingLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont_), TRUE);
-  subtitleLabel_ = label(L"Native CAD conversion and Draco-ready GLB export", 44, 62, 700, 24);
+  subtitleLabel_ = label(L"Native CAD conversion with Draco and Meshopt GLB export", 44, 62, 700, 24);
   selectButton_ = add(0, L"BUTTON", L"Drop a CAD file here or click to browse",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                       44, 98, 892, 168, IDC_SELECT);
@@ -312,17 +404,18 @@ void App::createControls() {
   SendMessageW(appearanceCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Preserve textures"));
   SendMessageW(appearanceCombo_, CB_SETCURSEL, 0, 0);
 
-  label(L"Draco", 478, 306, 100, 22);
+  label(L"Compression", 478, 306, 150, 22);
   compressCombo_ = add(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-                       478, 330, 120, 180, IDC_COMPRESS);
+                       478, 330, 160, 180, IDC_COMPRESS);
   SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"none"));
   SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Draco"));
+  SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Meshopt (STL)"));
   SendMessageW(compressCombo_, CB_SETCURSEL, 0, 0);
 
-  label(L"Level", 618, 306, 100, 22);
+  label(L"Level", 648, 306, 100, 22);
   dracoLevelEdit_ = add(WS_EX_CLIENTEDGE, L"EDIT", L"7",
                         WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                        618, 330, 84, 32, IDC_DRACO_LEVEL);
+                        648, 330, 84, 32, IDC_DRACO_LEVEL);
 
   optimizeCheck_ = add(0, L"BUTTON", L"Optimize mesh", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
                         48, 376, 150, 26, IDC_OPTIMIZE);
@@ -960,7 +1053,8 @@ void App::applyProfileValues() {
 
 void App::updateOptionState() {
   const bool binary = SendMessageW(formatCombo_, CB_GETCURSEL, 0, 0) == 0;
-  const bool draco = SendMessageW(compressCombo_, CB_GETCURSEL, 0, 0) == 1;
+  const LRESULT compression = SendMessageW(compressCombo_, CB_GETCURSEL, 0, 0);
+  const bool draco = compression == 1;
   EnableWindow(compressCombo_, binary);
   EnableWindow(dracoLevelEdit_, binary && draco);
   if (!binary) SendMessageW(compressCombo_, CB_SETCURSEL, 0, 0);
@@ -974,6 +1068,15 @@ void App::updateOptionState() {
   else if (profile == 3) help = L"Fast preview: 2.00 deflection / 1.50 angular. Fastest conversion; small features may disappear.";
   else if (profile == 4) help = L"Custom mesh quality: edit deflection and angular tolerance directly.";
   if (!optimize) help = L"Optimize mesh off: faithful 0.20 deflection / 0.50 angular settings will be used.";
+  const bool stlSelected = !selectedInput_.empty() && lower(selectedInput_.extension().string()) == ".stl";
+  if (stlSelected) {
+    if (!optimize) help = L"STL optimization off: preserve all input polygons; optional Meshopt compression can still reduce file size.";
+    else if (profile == 0) help = L"STL large assembly: cleanup, weld, quantize, and target 50% polygons.";
+    else if (profile == 1) help = L"STL viewer balanced: cleanup, weld, quantize, and target 70% polygons.";
+    else if (profile == 2) help = L"STL CAD faithful: cleanup, weld, and quantize without polygon simplification.";
+    else if (profile == 3) help = L"STL fast preview: cleanup, weld, quantize, and target 25% polygons.";
+    else help = L"STL custom: deflection controls reduction ratio; angular controls simplification error.";
+  }
   SetWindowTextW(qualityHelp_, help);
 }
 
@@ -1030,6 +1133,7 @@ void App::selectInputPath(const fs::path& path) {
   ShowWindow(outputFileLabel_, SW_HIDE);
   ShowWindow(processingTimeLabel_, SW_HIDE);
   InvalidateRect(inputLabel_, nullptr, TRUE);
+  updateOptionState();
   setStatus(L"Ready to convert with the selected options.");
 }
 
@@ -1091,13 +1195,24 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
   }
 
   std::wstringstream quality;
-  quality << (options.optimize ? L"optimized profile=" : L"faithful profile=")
-          << (options.profile == "large" ? L"large" :
-              options.profile == "balanced" ? L"balanced" :
-              options.profile == "preview" ? L"preview" :
-              options.profile == "custom" ? L"custom" : L"faithful")
-          << L"\r\ndeflection=" << options.deflection
-          << L" angular=" << options.angular;
+  const bool isStl = lower(input.extension().string()) == ".stl";
+  const wchar_t* profileName = options.profile == "large" ? L"large" :
+                               options.profile == "balanced" ? L"balanced" :
+                               options.profile == "preview" ? L"preview" :
+                               options.profile == "custom" ? L"custom" : L"faithful";
+  if (isStl) {
+    int targetPercent = 100;
+    if (options.optimize && options.profile == "large") targetPercent = 50;
+    else if (options.optimize && options.profile == "balanced") targetPercent = 70;
+    else if (options.optimize && options.profile == "preview") targetPercent = 25;
+    else if (options.optimize && options.profile == "custom")
+      targetPercent = static_cast<int>(std::round(clampDouble(1.0 / std::max(1.0, options.deflection), 0.10, 1.0, 1.0) * 100.0));
+    quality << (options.optimize ? L"optimized profile=" : L"preserved profile=") << profileName
+            << L"\r\ntarget=" << targetPercent << L"% polygons";
+  } else {
+    quality << (options.optimize ? L"optimized profile=" : L"faithful profile=") << profileName
+            << L"\r\ndeflection=" << options.deflection << L" angular=" << options.angular;
+  }
 
   std::wstringstream saved;
   if (inputBytes > 0 && !inputError && !outputError) {
@@ -1111,7 +1226,8 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
   const std::wstring values[] = {
       L"INPUT\r\n" + sizeText(inputError ? 0 : inputBytes),
       L"OUTPUT\r\n" + sizeText(outputError ? 0 : outputBytes),
-      L"COMPRESSION\r\n" + (options.draco ? L"Draco level " + std::to_wstring(options.dracoLevel) : L"none"),
+      L"COMPRESSION\r\n" + (options.draco ? L"Draco level " + std::to_wstring(options.dracoLevel) :
+                                options.meshopt ? L"Meshopt" : L"none"),
       L"MESH QUALITY\r\n" + quality.str(),
       L"SIZE SAVED\r\n" + saved.str(),
       L"MESHES\r\n" + std::to_wstring(meshCount),
@@ -1149,11 +1265,25 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
       return false;
     }
   } else if (extension == ".stl") {
-    if (options.binary) {
+    if (options.binary && !options.draco) {
       try {
-        const std::vector<native_stl::Triangle> triangles = native_stl::read(input);
-        native_stl::writeGlb(output, triangles);
-        updateConversionInfo(input, output, options, document, triangles.size());
+        std::vector<native_stl::Triangle> triangles = native_stl::read(input);
+        if (options.optimize) triangles = native_stl::cleanup(triangles);
+        std::uint64_t outputPolygons = triangles.size();
+        const bool postProcess = options.optimize || options.meshopt;
+        fs::path rawOutput = output;
+        if (postProcess) rawOutput += L".native-raw.glb";
+        native_stl::writeGlb(rawOutput, triangles);
+        if (postProcess && !runGltfpack(rawOutput, output, options, outputPolygons, error)) {
+          std::error_code ignored;
+          fs::remove(rawOutput, ignored);
+          return false;
+        }
+        if (postProcess) {
+          std::error_code ignored;
+          fs::remove(rawOutput, ignored);
+        }
+        updateConversionInfo(input, output, options, document, outputPolygons);
         showNativePreview(triangles);
         return true;
       } catch (const std::exception& exception) {
@@ -1220,7 +1350,9 @@ ConvertOptions App::optionsFromControls() const {
   ConvertOptions options;
   options.binary = SendMessageW(formatCombo_, CB_GETCURSEL, 0, 0) == 0;
   options.colorsOnly = SendMessageW(appearanceCombo_, CB_GETCURSEL, 0, 0) == 0;
-  options.draco = options.binary && SendMessageW(compressCombo_, CB_GETCURSEL, 0, 0) == 1;
+  const LRESULT compression = SendMessageW(compressCombo_, CB_GETCURSEL, 0, 0);
+  options.draco = options.binary && compression == 1;
+  options.meshopt = options.binary && compression == 2;
   options.dracoLevel = static_cast<int>(readDouble(dracoLevelEdit_, 7.0, 0.0, 10.0));
   options.optimize = SendMessageW(optimizeCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
   const LRESULT profile = SendMessageW(profileCombo_, CB_GETCURSEL, 0, 0);
@@ -1254,7 +1386,7 @@ void App::convertSelected() {
                     (selectedInput_.stem().wstring() + L"-converted" + suffix);
   std::string error;
   std::wstringstream status;
-  const bool nativeStl = lower(selectedInput_.extension().string()) == ".stl" && options.binary;
+  const bool nativeStl = lower(selectedInput_.extension().string()) == ".stl" && options.binary && !options.draco;
   status << (nativeStl ? L"Converting with native C++ STL pipeline - " : L"Converting with OCCT 8.0.1 - ")
          << (options.binary ? L"GLB" : L"GLTF")
          << L" - " << (options.profile == "faithful" ? L"CAD faithful" :
@@ -1263,6 +1395,7 @@ void App::convertSelected() {
                          options.profile == "custom" ? L"Custom" : L"Large assembly")
          << L" - deflection " << options.deflection << L" - angular " << options.angular;
   if (options.draco) status << L" | Draco " << options.dracoLevel;
+  else if (options.meshopt) status << L" | Meshopt";
   setStatus(status.str());
   EnableWindow(convertButton_, FALSE);
   const auto conversionStart = std::chrono::steady_clock::now();

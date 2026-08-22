@@ -8,10 +8,17 @@ find_package(OpenCASCADE 8.0.1 REQUIRED
   COMPONENTS FoundationClasses ModelingData ModelingAlgorithms Visualization
              ApplicationFramework DataExchange)
 
+set(MESHOPT_BUILD_DEMO OFF CACHE BOOL "" FORCE)
+set(MESHOPT_BUILD_GLTFPACK ON CACHE BOOL "" FORCE)
+set(MESHOPT_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(MESHOPT_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/meshoptimizer)
+
 set(DRACO_RUNTIME_DLL "" CACHE FILEPATH
   "Optional Draco runtime DLL used by a Draco-enabled OCCT build")
 
 add_executable(cad-converter2 WIN32 src/main.cpp)
+add_dependencies(cad-converter2 gltfpack)
 target_include_directories(cad-converter2 PRIVATE
   ${OpenCASCADE_INCLUDE_DIR}
 )
@@ -40,6 +47,9 @@ add_custom_command(TARGET cad-converter2 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/run.bat"
     "$<TARGET_FILE_DIR:cad-converter2>/run.bat"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "$<TARGET_FILE:gltfpack>"
+    "$<TARGET_FILE_DIR:cad-converter2>/gltfpack.exe"
 )
 
 if(EXISTS "${DRACO_RUNTIME_DLL}")
