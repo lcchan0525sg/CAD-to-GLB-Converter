@@ -1152,11 +1152,6 @@ void App::showPreview(const Handle(TDocStd_Document)& document) {
   SetWindowPos(previewPanel_, HWND_TOP, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
   populateAssemblyTree(document);
-  const std::vector<native_stl::Triangle> previewTriangles = collectDocumentTriangles(document);
-  if (!previewTriangles.empty()) {
-    showNativePreviewGeometry(previewTriangles);
-    return;
-  }
   if (previewContext_.IsNull() || view_.IsNull()) return;
   previewContext_->RemoveAll(false);
   previewObjects_.clear();

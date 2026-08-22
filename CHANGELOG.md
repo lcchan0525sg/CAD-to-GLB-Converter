@@ -1,5 +1,11 @@
 # Changelog
 
+## V0.34D
+
+- Routes STEP and IGES previews through OCCT XCAF so original per-part CAD colors are visible.
+- Keeps the native blue OpenGL preview path for STL input.
+- Preserves V0.33D validation, assembly checks, and compact layout behavior.
+
 ## V0.33D
 
 - Made V0.33D the maintained main build and default CMake configuration.

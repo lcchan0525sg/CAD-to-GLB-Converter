@@ -72,7 +72,7 @@ def main() -> int:
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parents[1]
-    exe = args.exe or repo / "build-v033d-default" / "Release" / "cad-converter2.exe"
+    exe = args.exe or repo / "build-v034d-default" / "Release" / "cad-converter2.exe"
     fixtures = args.fixtures or repo.parent / "cad-viewer-web" / "cad-samples"
     output = args.output or Path(tempfile.gettempdir()) / "cad-converter2-regression"
     cases = [
