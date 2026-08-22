@@ -18,6 +18,8 @@
 #include <gp_Vec.hxx>
 #include <IGESCAFControl_Reader.hxx>
 #include <Message_ProgressRange.hxx>
+#include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressScope.hxx>
 #include <NCollection_IndexedDataMap.hxx>
 #include <NCollection_Sequence.hxx>
 #include <OpenGl_GraphicDriver.hxx>
@@ -48,6 +50,7 @@
 #include <XCAFDoc_ColorTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 #include "native_stl.hpp"
+#include "gltf_validation.hxx"
 #include "version.hpp"
 #include "xcaf_structure.hxx"
 
@@ -65,10 +68,12 @@
 #include <cfloat>
 #include <cwchar>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <cstring>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <set>
@@ -102,12 +107,72 @@ struct ConversionResult {
 struct ConversionJob {
   fs::path input;
   fs::path output;
+  fs::path downloadName;
   ConvertOptions options;
   ConversionResult result;
   std::string error;
   bool success = false;
+  bool cancelled = false;
   double seconds = 0.0;
+  HWND window{};
+  std::shared_ptr<std::atomic_bool> cancelRequested = std::make_shared<std::atomic_bool>(false);
+  int lastProgressPercent = -1;
+  std::wstring lastProgressPhase;
 };
+
+struct ConversionProgress {
+  std::wstring text;
+};
+
+class UiProgressIndicator final : public Message_ProgressIndicator {
+  DEFINE_STANDARD_RTTIEXT(UiProgressIndicator, Message_ProgressIndicator)
+
+public:
+  UiProgressIndicator(std::shared_ptr<std::atomic_bool> cancelRequested,
+                      std::function<void(double)> callback)
+      : cancelRequested_(std::move(cancelRequested)), callback_(std::move(callback)) {}
+
+protected:
+  bool UserBreak() override {
+    return cancelRequested_ && cancelRequested_->load(std::memory_order_relaxed);
+  }
+
+  void Show(const Message_ProgressScope&, bool) override {
+    if (callback_) callback_(GetPosition());
+  }
+
+private:
+  std::shared_ptr<std::atomic_bool> cancelRequested_;
+  std::function<void(double)> callback_;
+};
+
+IMPLEMENT_STANDARD_RTTIEXT(UiProgressIndicator, Message_ProgressIndicator)
+
+constexpr UINT WM_APP_CONVERSION_COMPLETE = WM_APP + 101;
+constexpr UINT WM_APP_CONVERSION_PROGRESS = WM_APP + 102;
+
+static void reportProgress(ConversionJob& job, const std::wstring& phase, int percent) {
+  percent = std::clamp(percent, 0, 100);
+  if (job.lastProgressPercent == percent && job.lastProgressPhase == phase) return;
+  job.lastProgressPercent = percent;
+  job.lastProgressPhase = phase;
+  auto* progress = new ConversionProgress{phase + L" (" + std::to_wstring(percent) + L"%)"};
+  if (!PostMessageW(job.window, WM_APP_CONVERSION_PROGRESS, 0,
+                    reinterpret_cast<LPARAM>(progress))) {
+    delete progress;
+  }
+}
+
+static bool cancellationRequested(const ConversionJob& job) {
+  return job.cancelRequested && job.cancelRequested->load(std::memory_order_relaxed);
+}
+
+static bool failIfCancelled(ConversionJob& job, std::string& error) {
+  if (!cancellationRequested(job)) return false;
+  job.cancelled = true;
+  error = "conversion cancelled";
+  return true;
+}
 
 constexpr LRESULT kCompressionNoneIndex = 0;
 #if CAD_CONVERTER_HAS_DRACO
@@ -148,6 +213,36 @@ static fs::path executableDirectory() {
   std::vector<wchar_t> buffer(32768, L'\0');
   const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
   return length == 0 ? fs::current_path() : fs::path(std::wstring(buffer.data(), length)).parent_path();
+}
+
+static std::string utf8(const std::wstring& value) {
+  if (value.empty()) return {};
+  const int length = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+                                        static_cast<int>(value.size()),
+                                        nullptr, 0, nullptr, nullptr);
+  if (length <= 0) return {};
+  std::string result(static_cast<std::size_t>(length), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                      result.data(), length, nullptr, nullptr);
+  return result;
+}
+
+static gltf_validation::Expectations validationExpectations(
+    const Handle(TDocStd_Document)& document, bool expectIgesFallbackNames) {
+  gltf_validation::Expectations expectations;
+  const xcaf_structure::AssemblySignature signature =
+      xcaf_structure::assemblySignature(document);
+  expectations.sourceRootCount = signature.rootCount;
+  expectations.sourceComponentCount = signature.componentCount;
+  expectations.sourceLeafCount = signature.leafCount;
+  if (expectIgesFallbackNames) {
+    expectations.requiredFallbackPartNames = signature.componentCount;
+  }
+  for (const std::wstring& name : signature.meaningfulNames) {
+    const std::string encoded = utf8(name);
+    if (!encoded.empty()) expectations.requiredNodeNames.push_back(encoded);
+  }
+  return expectations;
 }
 
 static std::wstring quoted(const fs::path& path) {
@@ -257,7 +352,7 @@ static bool validateSceneStructure(const fs::path& source, const fs::path& optim
 static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
                         const ConvertOptions& options, std::uint64_t& outputPolygons,
                         std::string& error, bool allowSimplification = true,
-                        bool preserveSceneStructure = false) {
+                        bool preserveSceneStructure = false, ConversionJob* job = nullptr) {
   const fs::path tool = executableDirectory() / L"gltfpack.exe";
   if (!fs::is_regular_file(tool)) {
     error = "gltfpack.exe is missing beside the converter";
@@ -305,7 +400,17 @@ static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
     error = "failed to start gltfpack.exe";
     return false;
   }
-  WaitForSingleObject(process.hProcess, INFINITE);
+  bool cancelled = false;
+  for (;;) {
+    const DWORD waitResult = WaitForSingleObject(process.hProcess, 100);
+    if (waitResult == WAIT_OBJECT_0) break;
+    if (job && cancellationRequested(*job)) {
+      cancelled = true;
+      TerminateProcess(process.hProcess, ERROR_CANCELLED);
+      WaitForSingleObject(process.hProcess, INFINITE);
+      break;
+    }
+  }
   DWORD exitCode = 1;
   GetExitCodeProcess(process.hProcess, &exitCode);
   CloseHandle(process.hThread);
@@ -313,9 +418,11 @@ static bool runGltfpack(const fs::path& rawInput, const fs::path& output,
   const bool counted = readTriangleCount(report, outputPolygons);
   const bool structureValid = !preserveSceneStructure || validateSceneStructure(rawInput, output);
   fs::remove(report, ignored);
-  if (exitCode != 0 || !fs::is_regular_file(output) || !counted || !structureValid) {
+  if (cancelled && job) failIfCancelled(*job, error);
+  if (cancelled || exitCode != 0 || !fs::is_regular_file(output) || !counted || !structureValid) {
     error = structureValid ? "meshoptimizer post-process failed"
                            : "meshoptimizer changed STEP/IGES assembly structure or names";
+    if (cancelled && job) error = "conversion cancelled";
     fs::remove(output, ignored);
     return false;
   }
@@ -366,12 +473,15 @@ enum ControlId {
   IDC_DEFLECTION,
   IDC_ANGULAR,
   IDC_MANUAL_HELP,
+  IDC_CANCEL,
+  IDC_DOWNLOAD,
 };
 
 class App {
 public:
   explicit App(HINSTANCE instance) : instance_(instance) {}
   int run(const fs::path& autoInput = {});
+  int runRegression(const fs::path& input, const fs::path& output);
 
 private:
   static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
@@ -398,23 +508,28 @@ private:
   bool drawButton(const DRAWITEMSTRUCT&);
   void releaseThemeResources();
   void setStatus(const std::wstring& message);
+  void updateResultLayout(bool showResults);
   void updateOptionState();
   void applyProfileValues();
   void handleCommand(WPARAM wParam);
   void chooseInput();
+  void downloadOutput();
   void openHelp();
   void selectInputPath(const fs::path& path);
   void handleDropFiles(HDROP drop);
   void convertSelected();
+  void cancelConversion();
+  void handleConversionProgress(ConversionProgress* progress);
   void handleConversionComplete(ConversionJob* job);
   void updateConversionInfo(const fs::path& input, const fs::path& output,
                             const ConvertOptions& options,
                             const Handle(TDocStd_Document)& document,
                             std::uint64_t outputPolygonOverride = 0,
-                            std::uint64_t inputPolygonOverride = 0);
+                            std::uint64_t inputPolygonOverride = 0,
+                            double processingSeconds = 0.0);
   ConvertOptions optionsFromControls() const;
-  bool convertCad(const fs::path& input, const fs::path& output, const ConvertOptions& options,
-                  ConversionResult& result, std::string& error);
+  bool convertCad(ConversionJob& job, const fs::path& input, const fs::path& output,
+                  const ConvertOptions& options, ConversionResult& result, std::string& error);
 
   HINSTANCE instance_{};
   HWND window_{};
@@ -429,13 +544,16 @@ private:
   HWND angularEdit_{};
   HWND selectButton_{};
   HWND convertButton_{};
+  HWND cancelButton_{};
   HWND helpButton_{};
   HWND qualityHelp_{};
   HWND statusLabel_{};
-  HWND outputFileLabel_{};
-  HWND processingTimeLabel_{};
+  HWND downloadButton_{};
   HWND conversionInfoHeader_{};
-  std::array<HWND, 9> conversionStats_{};
+  std::array<HWND, 10> conversionStats_{};
+  HWND assemblyHeader_{};
+  HWND previewHeader_{};
+  HWND previewHelp_{};
   HWND assemblyTree_{};
   HWND previewPanel_{};
   HWND nativePreviewPanel_{};
@@ -479,10 +597,12 @@ private:
   std::thread conversionWorker_;
   bool inputSelected_ = false;
   fs::path selectedInput_;
+  fs::path completedOutputPath_;
+  fs::path completedDownloadName_;
+  std::shared_ptr<std::atomic_bool> activeCancelRequested_;
 };
 
 static App* g_app = nullptr;
-constexpr UINT WM_APP_CONVERSION_COMPLETE = WM_APP + 101;
 
 int App::run(const fs::path& autoInput) {
   g_app = this;
@@ -578,9 +698,13 @@ void App::createControls() {
                       44, 98, 892, 168, IDC_SELECT);
   inputLabel_ = label(L"No model selected", 48, 276, 820, 24);
   convertButton_ = add(0, L"BUTTON", L"Convert", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | WS_DISABLED,
-                       48, 414, 520, 42, IDC_CONVERT);
+                       48, 414, 250, 42, IDC_CONVERT);
+  cancelButton_ = add(0, L"BUTTON", L"Cancel conversion", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                          BS_OWNERDRAW | WS_DISABLED,
+                      310, 414, 250, 42, IDC_CANCEL);
   SendMessageW(selectButton_, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont_), TRUE);
   SendMessageW(convertButton_, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont_), TRUE);
+  SendMessageW(cancelButton_, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont_), TRUE);
   DragAcceptFiles(selectButton_, TRUE);
   selectOriginalProc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
       selectButton_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&App::dropProc)));
@@ -638,37 +762,38 @@ void App::createControls() {
                      728, 410, 84, 32, IDC_ANGULAR);
 
   qualityHelp_ = label(L"Large assembly: 1.00 deflection / 1.00 angular. Fewer triangles and faster browser interaction.",
-                       48, 458, 1160, 42);
-  statusLabel_ = label(L"Ready. Select a STEP or IGES file.", 48, 500, 850, 24);
-  outputFileLabel_ = label(L"", 48, 526, 1160, 24);
-  processingTimeLabel_ = label(L"", 48, 552, 1160, 24);
-  ShowWindow(outputFileLabel_, SW_HIDE);
-  ShowWindow(processingTimeLabel_, SW_HIDE);
-  conversionInfoHeader_ = label(L"CONVERSION INFORMATION", 48, 584, 1160, 28);
+                       48, 462, 1160, 24);
+  statusLabel_ = label(L"Ready. Select a STEP, IGES, or STL file.", 48, 490, 1160, 24);
+  downloadButton_ = add(0, L"BUTTON", L"Download", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW | WS_DISABLED,
+                        572, 414, 250, 42, IDC_DOWNLOAD);
+  ShowWindow(downloadButton_, SW_HIDE);
+  conversionInfoHeader_ = label(L"CONVERSION INFORMATION", 48, 522, 1160, 28);
   const int statX[] = {48, 292, 536, 780, 1024};
   const wchar_t* statTitles[] = {L"INPUT", L"OUTPUT", L"COMPRESSION", L"MESH QUALITY", L"PARTS",
-                                 L"ORIGINAL B-REP FACES", L"RESULT MESH FACES", L"FACE REDUCTION", L"SIZE SAVED"};
-  for (int i = 0; i < 9; ++i) {
+                                 L"ORIGINAL B-REP FACES", L"RESULT MESH FACES", L"FACE REDUCTION", L"SIZE SAVED",
+                                 L"PROCESSING TIME"};
+  for (int i = 0; i < 10; ++i) {
     const int row = i / 5;
     const int column = i % 5;
-    conversionStats_[i] = label(statTitles[i], statX[column], 618 + row * 58, 220, 48);
+    conversionStats_[i] = label(statTitles[i], statX[column], 554 + row * 58, 220, 48);
     ShowWindow(conversionStats_[i], SW_HIDE);
   }
   ShowWindow(conversionInfoHeader_, SW_HIDE);
-  label(L"ASSEMBLY TREE", 44, 768, 280, 28);
+  assemblyHeader_ = label(L"ASSEMBLY TREE", 44, 548, 280, 28);
   assemblyTree_ = add(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | TVS_HASBUTTONS |
                           TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS,
-                      44, 804, 280, 390, 0);
-  label(L"3D Preview", 340, 768, 896, 28);
+                      44, 580, 280, 636, 0);
+  previewHeader_ = label(L"3D Preview", 340, 548, 896, 28);
   previewPanel_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"CadOcctPreviewWindow", L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-                                  340, 804, 896, 390, window_, nullptr, instance_, nullptr);
+                                  340, 580, 896, 636, window_, nullptr, instance_, nullptr);
   nativePreviewPanel_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"CadNativePreviewWindow", L"",
                                         WS_CHILD | WS_TABSTOP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-                                        340, 804, 896, 390, window_, nullptr, instance_, nullptr);
+                                        340, 580, 896, 636, window_, nullptr, instance_, nullptr);
   ShowWindow(nativePreviewPanel_, SW_HIDE);
-  label(L"Left drag: rotate  |  Middle drag: pan  |  Wheel: zoom", 340, 1204, 896, 24);
+  previewHelp_ = label(L"Left drag: rotate  |  Middle drag: pan  |  Wheel: zoom", 340, 1226, 896, 24);
+  updateResultLayout(false);
   updateOptionState();
   initializePreview();
 }
@@ -1212,19 +1337,21 @@ bool App::paintBackground(HDC dc) {
   HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(226, 232, 240));
   HGDIOBJ oldBrush = SelectObject(dc, cardBrush);
   HGDIOBJ oldPen = SelectObject(dc, borderPen);
-  RoundRect(dc, 20, 16, client.right - 20, 738, 14, 14);
-  RoundRect(dc, 20, 748, client.right - 20, 1242, 14, 14);
+  const bool showResults = IsWindowVisible(conversionInfoHeader_) != FALSE;
+  const int sectionTop = showResults ? 688 : 530;
+  RoundRect(dc, 20, 16, client.right - 20, showResults ? 678 : 520, 14, 14);
+  RoundRect(dc, 20, sectionTop, client.right - 20, 1242, 14, 14);
   if (IsWindowVisible(conversionStats_[0])) {
     HBRUSH statsCardBrush = CreateSolidBrush(RGB(248, 250, 252));
     HPEN statsBorderPen = CreatePen(PS_SOLID, 1, RGB(213, 221, 232));
     HGDIOBJ oldStatsBrush = SelectObject(dc, statsCardBrush);
     HGDIOBJ oldStatsPen = SelectObject(dc, statsBorderPen);
     const int statX[] = {48, 292, 536, 780, 1024};
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < 10; ++i) {
       const int row = i / 5;
       const int column = i % 5;
       const int x = statX[column];
-      const int y = 608 + row * 58;
+      const int y = 550 + row * 58;
       RoundRect(dc, x, y, x + 220, y + 52, 8, 8);
     }
     SelectObject(dc, oldStatsPen);
@@ -1258,10 +1385,6 @@ HBRUSH App::paintControl(HDC dc, HWND control, UINT message) {
     SetTextColor(dc, RGB(15, 23, 42));
   } else if (control == inputLabel_) {
     SetTextColor(dc, inputSelected_ ? RGB(72, 170, 103) : RGB(15, 23, 42));
-  } else if (control == outputFileLabel_) {
-    SetTextColor(dc, RGB(72, 170, 103));
-  } else if (control == processingTimeLabel_) {
-    SetTextColor(dc, RGB(100, 116, 139));
   } else if (control == statusLabel_) {
     SetTextColor(dc, conversionSucceeded_ ? RGB(72, 170, 103) : RGB(30, 64, 175));
   } else {
@@ -1271,7 +1394,8 @@ HBRUSH App::paintControl(HDC dc, HWND control, UINT message) {
 }
 
 bool App::drawButton(const DRAWITEMSTRUCT& draw) {
-  if (draw.hwndItem != selectButton_ && draw.hwndItem != convertButton_) return false;
+  if (draw.hwndItem != selectButton_ && draw.hwndItem != convertButton_ &&
+      draw.hwndItem != cancelButton_ && draw.hwndItem != downloadButton_) return false;
   if (draw.hwndItem == selectButton_) {
     HBRUSH fillBrush = CreateSolidBrush(RGB(247, 250, 255));
     HPEN borderPen = CreatePen(PS_DASH, 2, RGB(91, 133, 255));
@@ -1312,7 +1436,7 @@ bool App::drawButton(const DRAWITEMSTRUCT& draw) {
     if ((draw.itemState & ODS_FOCUS) != 0) DrawFocusRect(draw.hDC, &draw.rcItem);
     return true;
   }
-  const bool isPrimary = draw.hwndItem == convertButton_;
+  const bool isPrimary = draw.hwndItem == convertButton_ || draw.hwndItem == downloadButton_;
   const bool isDisabled = (draw.itemState & ODS_DISABLED) != 0;
   const bool isPressed = (draw.itemState & ODS_SELECTED) != 0;
   const COLORREF fill = isDisabled ? RGB(148, 163, 184)
@@ -1358,6 +1482,24 @@ void App::releaseThemeResources() {
 
 void App::setStatus(const std::wstring& message) {
   SetWindowTextW(statusLabel_, message.c_str());
+  ShowWindow(statusLabel_, SW_SHOW);
+}
+
+void App::updateResultLayout(bool showResults) {
+  ShowWindow(conversionInfoHeader_, showResults ? SW_SHOW : SW_HIDE);
+  for (HWND stat : conversionStats_) ShowWindow(stat, showResults ? SW_SHOW : SW_HIDE);
+
+  const int headerY = showResults ? 706 : 548;
+  const int panelY = showResults ? 738 : 580;
+  const int panelHeight = 1216 - panelY;
+  MoveWindow(assemblyHeader_, 44, headerY, 280, 28, TRUE);
+  MoveWindow(previewHeader_, 340, headerY, 896, 28, TRUE);
+  MoveWindow(assemblyTree_, 44, panelY, 280, panelHeight, TRUE);
+  MoveWindow(previewPanel_, 340, panelY, 896, panelHeight, TRUE);
+  MoveWindow(nativePreviewPanel_, 340, panelY, 896, panelHeight, TRUE);
+  MoveWindow(previewHelp_, 340, 1226, 896, 24, TRUE);
+  InvalidateRect(window_, nullptr, TRUE);
+  resizePreview();
 }
 
 void App::applyProfileValues() {
@@ -1422,10 +1564,14 @@ void App::handleCommand(WPARAM wParam) {
   const int code = HIWORD(wParam);
   if (id == IDC_SELECT && code == BN_CLICKED) chooseInput();
   else if (id == IDC_CONVERT && code == BN_CLICKED) convertSelected();
+  else if (id == IDC_CANCEL && code == BN_CLICKED) cancelConversion();
+  else if (id == IDC_DOWNLOAD && code == BN_CLICKED) downloadOutput();
   else if (id == IDC_MANUAL_HELP && code == BN_CLICKED) openHelp();
   else if (id == IDC_PROFILE && code == CBN_SELCHANGE) { applyProfileValues(); updateOptionState(); }
   else if ((id == IDC_FORMAT || id == IDC_COMPRESS || id == IDC_OPTIMIZE) &&
-           (code == CBN_SELCHANGE || code == BN_CLICKED)) updateOptionState();
+           (code == CBN_SELCHANGE || code == BN_CLICKED)) {
+    updateOptionState();
+  }
   else if ((id == IDC_DEFLECTION || id == IDC_ANGULAR) && code == EN_CHANGE) updateOptionState();
 }
 
@@ -1446,6 +1592,44 @@ void App::chooseInput() {
   const fs::path selectedPath(path);
   CoTaskMemFree(path);
   selectInputPath(selectedPath);
+}
+
+void App::downloadOutput() {
+  if (completedOutputPath_.empty() || !fs::is_regular_file(completedOutputPath_)) {
+    setStatus(L"Error: the completed output is no longer available.");
+    return;
+  }
+  ComPtr<IFileSaveDialog> dialog;
+  if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&dialog)))) return;
+  const bool binary = completedOutputPath_.extension() == L".glb";
+  COMDLG_FILTERSPEC filters[] = {
+      {binary ? L"GLB files" : L"GLTF files", binary ? L"*.glb" : L"*.gltf"},
+      {L"All files", L"*.*"},
+  };
+  dialog->SetFileTypes(2, filters);
+  dialog->SetDefaultExtension(binary ? L"glb" : L"gltf");
+  dialog->SetFileName(completedDownloadName_.filename().c_str());
+  FILEOPENDIALOGOPTIONS options = 0;
+  if (SUCCEEDED(dialog->GetOptions(&options))) {
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT);
+  }
+  if (FAILED(dialog->Show(window_))) return;
+  ComPtr<IShellItem> item;
+  if (FAILED(dialog->GetResult(&item))) return;
+  PWSTR path = nullptr;
+  if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) return;
+  const fs::path destination(path);
+  CoTaskMemFree(path);
+  std::error_code equivalentError;
+  if (fs::equivalent(completedOutputPath_, destination, equivalentError) && !equivalentError) {
+    setStatus(L"Output is already saved at the selected location.");
+    return;
+  }
+  if (!CopyFileW(completedOutputPath_.c_str(), destination.c_str(), FALSE)) {
+    setStatus(L"Error: Windows could not save the converted file.");
+    return;
+  }
 }
 
 void App::openHelp() {
@@ -1471,20 +1655,35 @@ void App::selectInputPath(const fs::path& path) {
   std::error_code fileError;
   if (!supported || !fs::is_regular_file(path, fileError)) {
     inputSelected_ = false;
+    selectedInput_.clear();
+    if (!completedOutputPath_.empty()) {
+      std::error_code ignored;
+      fs::remove(completedOutputPath_, ignored);
+    }
+    completedOutputPath_.clear();
+    completedDownloadName_.clear();
     conversionSucceeded_ = false;
     EnableWindow(convertButton_, FALSE);
-    ShowWindow(outputFileLabel_, SW_HIDE);
-    ShowWindow(processingTimeLabel_, SW_HIDE);
+    EnableWindow(downloadButton_, FALSE);
+    ShowWindow(downloadButton_, SW_HIDE);
+    updateResultLayout(false);
     setStatus(L"Error: drop a STEP, STP, IGES, or STL file.");
     return;
   }
   selectedInput_ = path;
+  if (!completedOutputPath_.empty()) {
+    std::error_code ignored;
+    fs::remove(completedOutputPath_, ignored);
+  }
+  completedOutputPath_.clear();
+  completedDownloadName_.clear();
   SetWindowTextW(inputLabel_, (L"Selected: " + selectedInput_.filename().wstring()).c_str());
   EnableWindow(convertButton_, TRUE);
+  EnableWindow(downloadButton_, FALSE);
+  ShowWindow(downloadButton_, SW_HIDE);
   inputSelected_ = true;
   conversionSucceeded_ = false;
-  ShowWindow(outputFileLabel_, SW_HIDE);
-  ShowWindow(processingTimeLabel_, SW_HIDE);
+  updateResultLayout(false);
   InvalidateRect(inputLabel_, nullptr, TRUE);
   updateOptionState();
   setStatus(L"Ready to convert with the selected options.");
@@ -1507,7 +1706,8 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
                                const ConvertOptions& options,
                                const Handle(TDocStd_Document)& document,
                                std::uint64_t outputPolygonOverride,
-                               std::uint64_t inputPolygonOverride) {
+                               std::uint64_t inputPolygonOverride,
+                               double processingSeconds) {
   std::error_code inputError;
   std::error_code outputError;
   const std::uintmax_t inputBytes = fs::file_size(input, inputError);
@@ -1599,6 +1799,9 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
     saved << L"n/a";
   }
 
+  std::wstringstream processing;
+  processing << std::fixed << std::setprecision(3) << processingSeconds << L" s";
+
   const std::wstring values[] = {
       L"INPUT\r\n" + sizeText(inputError ? 0 : inputBytes),
       L"OUTPUT\r\n" + sizeText(outputError ? 0 : outputBytes),
@@ -1611,18 +1814,19 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
       L"RESULT MESH FACES\r\n" + std::to_wstring(triangleCount),
       L"FACE REDUCTION\r\n" + reduction.str(),
       L"SIZE SAVED\r\n" + saved.str(),
+      L"PROCESSING TIME\r\n" + processing.str(),
   };
-  ShowWindow(conversionInfoHeader_, SW_SHOW);
   for (std::size_t i = 0; i < conversionStats_.size(); ++i) {
     SetWindowTextW(conversionStats_[i], values[i].c_str());
-    ShowWindow(conversionStats_[i], SW_SHOW);
   }
-  InvalidateRect(window_, nullptr, TRUE);
+  updateResultLayout(true);
 }
 
-bool App::convertCad(const fs::path& input, const fs::path& output, const ConvertOptions& options,
-                     ConversionResult& result, std::string& error) {
+bool App::convertCad(ConversionJob& job, const fs::path& input, const fs::path& output,
+                     const ConvertOptions& options, ConversionResult& result, std::string& error) {
   const std::string extension = lower(input.extension().string());
+  reportProgress(job, L"Preparing conversion...", 0);
+  if (failIfCancelled(job, error)) return false;
   if (options.draco && !CAD_CONVERTER_HAS_DRACO) {
     error = "Draco compression requires the Draco-enabled build";
     return false;
@@ -1634,19 +1838,36 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
   Handle(TDocStd_Document) document;
   XCAFApp_Application::GetApplication()->NewDocument(TCollection_ExtendedString("MDTV-XCAF"), document);
 
+  auto makeProgressIndicator = [&](const wchar_t* phase, int base, int span) {
+    const std::wstring phaseText(phase);
+    Handle(Message_ProgressIndicator) progress = new UiProgressIndicator(
+        job.cancelRequested,
+        [&job, phaseText, base, span](double position) {
+          reportProgress(job, phaseText,
+                         base + static_cast<int>(std::round(clampDouble(position, 0.0, 1.0, 0.0) * span)));
+        });
+    return progress;
+  };
+
   if (extension == ".step" || extension == ".stp") {
+    reportProgress(job, L"Reading STEP...", 5);
     STEPCAFControl_Reader reader;
     reader.SetColorMode(true);
     reader.SetNameMode(true);
-    if (!reader.Perform(input.string().c_str(), document)) {
+    Handle(Message_ProgressIndicator) progress = makeProgressIndicator(L"Reading STEP...", 5, 20);
+    if (!reader.Perform(input.string().c_str(), document, progress->Start())) {
+      if (failIfCancelled(job, error)) return false;
       error = "OCCT 8.0.1 STEP Perform failed";
       return false;
     }
   } else if (extension == ".igs" || extension == ".iges") {
+    reportProgress(job, L"Reading IGES...", 5);
     IGESCAFControl_Reader reader;
     reader.SetColorMode(true);
     reader.SetNameMode(true);
-    if (!reader.Perform(input.string().c_str(), document)) {
+    Handle(Message_ProgressIndicator) progress = makeProgressIndicator(L"Reading IGES...", 5, 20);
+    if (!reader.Perform(input.string().c_str(), document, progress->Start())) {
+      if (failIfCancelled(job, error)) return false;
       error = "OCCT 8.0.1 IGES Perform failed";
       return false;
     }
@@ -1654,15 +1875,21 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
   } else if (extension == ".stl") {
     if (options.binary && !options.draco) {
       try {
+        reportProgress(job, L"Reading STL...", 5);
         std::vector<native_stl::Triangle> triangles = native_stl::read(input);
         const std::uint64_t inputPolygonCount = triangles.size();
+        if (failIfCancelled(job, error)) return false;
         if (options.optimize) triangles = native_stl::cleanup(triangles);
+        reportProgress(job, L"Preparing STL mesh...", 35);
+        if (failIfCancelled(job, error)) return false;
         std::uint64_t outputPolygons = triangles.size();
         const bool postProcess = options.optimize || options.meshopt;
         fs::path rawOutput = output;
         if (postProcess) rawOutput += L".native-raw.glb";
+        reportProgress(job, L"Writing GLB...", 55);
         native_stl::writeGlb(rawOutput, triangles);
-        if (postProcess && !runGltfpack(rawOutput, output, options, outputPolygons, error)) {
+        if (postProcess && !runGltfpack(rawOutput, output, options, outputPolygons, error,
+                                        true, false, &job)) {
           std::error_code ignored;
           fs::remove(rawOutput, ignored);
           return false;
@@ -1675,6 +1902,15 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
         result.inputPolygons = inputPolygonCount;
         result.nativeTriangles = std::move(triangles);
         result.useNativePreview = true;
+        reportProgress(job, L"Validating output...", 95);
+        if (failIfCancelled(job, error)) return false;
+        gltf_validation::Summary validationSummary;
+        std::string validationError;
+        if (!gltf_validation::validate(output, {}, validationSummary, validationError)) {
+          error = "output validation failed: " + validationError;
+          return false;
+        }
+        reportProgress(job, L"Conversion complete", 100);
         return true;
       } catch (const std::exception& exception) {
         error = exception.what();
@@ -1702,9 +1938,16 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
     return false;
   }
 
+  if (failIfCancelled(job, error)) return false;
+  reportProgress(job, L"Building XCAF assembly...", 28);
+
   const Handle(XCAFDoc_ShapeTool) shapeTool = XCAFDoc_DocumentTool::ShapeTool(document->Main());
   NCollection_Sequence<TDF_Label> roots;
   shapeTool->GetFreeShapes(roots);
+  if (roots.Length() == 0) {
+    error = "OCCT imported no XCAF shapes";
+    return false;
+  }
   double meshDeflection = options.deflection;
   double meshAngular = options.angular;
   if (options.optimize && (extension == ".step" || extension == ".stp" ||
@@ -1714,19 +1957,28 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
     meshDeflection = quality.deflection;
     meshAngular = quality.angular;
   }
+  Handle(Message_ProgressIndicator) meshProgress = makeProgressIndicator(
+      L"Meshing", 30, 40);
+  Message_ProgressRange meshRange = meshProgress->Start();
+  Message_ProgressScope meshScope(meshRange, "Meshing", roots.Length());
   for (Standard_Integer i = 1; i <= roots.Length(); ++i) {
+    if (failIfCancelled(job, error)) return false;
     TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(roots.Value(i));
     if (!shape.IsNull()) {
       BRepTools::Clean(shape);
       BRepMesh_IncrementalMesh mesh(shape, meshDeflection, Standard_False,
                                      meshAngular, Standard_True);
+      mesh.Perform(meshScope.Next());
       if (!mesh.IsDone()) {
+        if (failIfCancelled(job, error)) return false;
         error = "OCCT triangulation failed";
         return false;
       }
     }
   }
 
+  reportProgress(job, L"Writing GLB...", 75);
+  if (failIfCancelled(job, error)) return false;
   RWGltf_CafWriter writer(TCollection_AsciiString(output.string().c_str()), options.binary);
   writer.SetMergeFaces(true);
   writer.SetSplitIndices16(true);
@@ -1737,15 +1989,33 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
   draco.CompressionLevel = options.dracoLevel;
   writer.SetCompressionParameters(draco);
   NCollection_IndexedDataMap<TCollection_AsciiString, TCollection_AsciiString> metadata;
-  if (!writer.Perform(document, metadata, Message_ProgressRange())) {
+  Handle(Message_ProgressIndicator) writeProgress = makeProgressIndicator(
+      L"Writing GLB...", 75, 20);
+  if (!writer.Perform(document, metadata, writeProgress->Start())) {
+    if (failIfCancelled(job, error)) return false;
     error = "OCCT 8.0.1 GLB export failed";
     return false;
   }
+  reportProgress(job, L"Validating output...", 97);
+  if (failIfCancelled(job, error)) return false;
   if ((extension == ".igs" || extension == ".iges") &&
       !xcaf_structure::renameFallbackGltfNodes(output, error)) {
     return false;
   }
+  gltf_validation::Expectations expectations;
+  if (extension == ".step" || extension == ".stp" ||
+      extension == ".igs" || extension == ".iges") {
+    expectations = validationExpectations(
+        document, extension == ".igs" || extension == ".iges");
+  }
+  gltf_validation::Summary validationSummary;
+  std::string validationError;
+  if (!gltf_validation::validate(output, expectations, validationSummary, validationError)) {
+    error = "output validation failed: " + validationError;
+    return false;
+  }
   result.document = document;
+  reportProgress(job, L"Conversion complete", 100);
   return true;
 }
 
@@ -1779,17 +2049,36 @@ void App::convertSelected() {
   if (selectedInput_.empty()) {
     inputSelected_ = false;
     conversionSucceeded_ = false;
-    ShowWindow(outputFileLabel_, SW_HIDE);
-    ShowWindow(processingTimeLabel_, SW_HIDE);
+    updateResultLayout(false);
     setStatus(L"Error: select a STEP, IGES, or STL model first.");
     return;
   }
+  if (!completedOutputPath_.empty()) {
+    std::error_code ignored;
+    fs::remove(completedOutputPath_, ignored);
+  }
+  completedOutputPath_.clear();
+  completedDownloadName_.clear();
+  EnableWindow(downloadButton_, FALSE);
+  ShowWindow(downloadButton_, SW_HIDE);
+  updateResultLayout(false);
   auto* job = new ConversionJob();
   job->input = selectedInput_;
   job->options = optionsFromControls();
   const std::wstring suffix = job->options.binary ? L".glb" : L".gltf";
-  job->output = job->input.parent_path() /
-                (job->input.stem().wstring() + L"-converted" CAD_CONVERTER_OUTPUT_SUFFIX_TEXT + suffix);
+  job->downloadName = fs::path(job->input.stem().wstring() + L"-converted" +
+                               std::wstring(CAD_CONVERTER_OUTPUT_SUFFIX_TEXT) + suffix);
+  std::error_code temporaryDirectoryError;
+  const fs::path temporaryDirectory = fs::temp_directory_path(temporaryDirectoryError);
+  if (temporaryDirectoryError) {
+    setStatus(L"Error: Windows could not prepare temporary output storage.");
+    delete job;
+    return;
+  }
+  job->output = temporaryDirectory /
+                (L"cad-converter2-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                 std::to_wstring(GetTickCount64()) + L"-" + job->downloadName.wstring());
+  job->window = window_;
   std::wstringstream status;
   const bool nativeStl = lower(job->input.extension().string()) == ".stl" &&
                          job->options.binary && !job->options.draco;
@@ -1802,11 +2091,13 @@ void App::convertSelected() {
          << L" - working in background";
   setStatus(status.str());
   conversionRunning_ = true;
+  activeCancelRequested_ = job->cancelRequested;
   EnableWindow(convertButton_, FALSE);
   EnableWindow(selectButton_, FALSE);
+  EnableWindow(cancelButton_, TRUE);
   conversionWorker_ = std::thread([this, job] {
     const auto start = std::chrono::steady_clock::now();
-    job->success = convertCad(job->input, job->output, job->options, job->result, job->error);
+    job->success = convertCad(*job, job->input, job->output, job->options, job->result, job->error);
     job->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (!PostMessageW(window_, WM_APP_CONVERSION_COMPLETE, 0, reinterpret_cast<LPARAM>(job))) {
       delete job;
@@ -1814,32 +2105,50 @@ void App::convertSelected() {
   });
 }
 
+void App::cancelConversion() {
+  if (!conversionRunning_ || !activeCancelRequested_) return;
+  activeCancelRequested_->store(true, std::memory_order_relaxed);
+  EnableWindow(cancelButton_, FALSE);
+  setStatus(L"Cancellation requested. Finishing the current safe step...");
+}
+
+void App::handleConversionProgress(ConversionProgress* progress) {
+  if (!progress) return;
+  if (conversionRunning_) setStatus(progress->text);
+  delete progress;
+}
+
 void App::handleConversionComplete(ConversionJob* job) {
   if (conversionWorker_.joinable()) conversionWorker_.join();
   conversionRunning_ = false;
+  activeCancelRequested_.reset();
   EnableWindow(selectButton_, TRUE);
   EnableWindow(convertButton_, TRUE);
+  EnableWindow(cancelButton_, FALSE);
   if (!job->success) {
     conversionSucceeded_ = false;
-    ShowWindow(outputFileLabel_, SW_HIDE);
-    ShowWindow(processingTimeLabel_, SW_HIDE);
-    setStatus(L"Error: " + std::wstring(job->error.begin(), job->error.end()));
+    std::error_code ignored;
+    fs::remove(job->output, ignored);
+    completedOutputPath_.clear();
+    completedDownloadName_.clear();
+    EnableWindow(downloadButton_, FALSE);
+    ShowWindow(downloadButton_, SW_HIDE);
+    updateResultLayout(false);
+    if (job->cancelled) setStatus(L"Conversion cancelled safely.");
+    else setStatus(L"Error: " + std::wstring(job->error.begin(), job->error.end()));
     delete job;
     return;
   }
   conversionSucceeded_ = true;
   updateConversionInfo(job->input, job->output, job->options, job->result.document,
-                       job->result.outputPolygons, job->result.inputPolygons);
+                       job->result.outputPolygons, job->result.inputPolygons, job->seconds);
   if (job->result.useNativePreview) showNativePreview(job->result.nativeTriangles);
   else showPreview(job->result.document);
-  SetWindowTextW(outputFileLabel_, (L"Output file: " + job->output.filename().wstring()).c_str());
-  ShowWindow(outputFileLabel_, SW_SHOW);
-  std::wstringstream processing;
-  processing << L"Processing time: " << std::fixed << std::setprecision(3)
-             << job->seconds << L" s";
-  SetWindowTextW(processingTimeLabel_, processing.str().c_str());
-  ShowWindow(processingTimeLabel_, SW_SHOW);
-  setStatus(L"Done - " + job->output.filename().wstring() + L" - ready to preview");
+  completedOutputPath_ = job->output;
+  completedDownloadName_ = job->downloadName;
+  ShowWindow(statusLabel_, SW_HIDE);
+  EnableWindow(downloadButton_, TRUE);
+  ShowWindow(downloadButton_, SW_SHOW);
   delete job;
 }
 
@@ -1863,13 +2172,15 @@ LRESULT CALLBACK App::windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
       case WM_COMMAND:
         g_app->handleCommand(wParam);
         return 0;
+      case WM_APP_CONVERSION_PROGRESS:
+        g_app->handleConversionProgress(reinterpret_cast<ConversionProgress*>(lParam));
+        return 0;
       case WM_APP_CONVERSION_COMPLETE:
         g_app->handleConversionComplete(reinterpret_cast<ConversionJob*>(lParam));
         return 0;
       case WM_CLOSE:
         if (g_app->conversionRunning_) {
-          MessageBoxW(hwnd, L"Conversion is still running. Wait for it to finish before closing.",
-                      L"CAD Converter 2", MB_OK | MB_ICONINFORMATION);
+          g_app->cancelConversion();
           return 0;
         }
         DestroyWindow(hwnd);
@@ -1879,6 +2190,10 @@ LRESULT CALLBACK App::windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
         break;
       case WM_DESTROY:
         if (g_app->conversionWorker_.joinable()) g_app->conversionWorker_.join();
+        if (!g_app->completedOutputPath_.empty()) {
+          std::error_code ignored;
+          fs::remove(g_app->completedOutputPath_, ignored);
+        }
         g_app->releaseThemeResources();
         PostQuitMessage(0);
         return 0;
@@ -1887,13 +2202,52 @@ LRESULT CALLBACK App::windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
   return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+int App::runRegression(const fs::path& input, const fs::path& output) {
+  std::error_code fileError;
+  if (!fs::is_regular_file(input, fileError)) return 2;
+  if (!output.parent_path().empty()) fs::create_directories(output.parent_path(), fileError);
+  if (fileError) return 2;
+
+  ConversionJob job;
+  job.input = input;
+  job.output = output;
+  job.options.binary = lower(output.extension().string()) == ".glb";
+  job.options.colorsOnly = true;
+  job.options.draco = lower(input.extension().string()) != ".stl" && CAD_CONVERTER_HAS_DRACO;
+  job.options.meshopt = false;
+  job.options.optimize = true;
+  job.options.profile = "large";
+  job.options.deflection = 1.0;
+  job.options.angular = 1.0;
+
+  std::string error;
+  const bool success = convertCad(job, input, output, job.options, job.result, error);
+  fs::path errorPath = output;
+  errorPath += L".error.txt";
+  if (!success) {
+    std::ofstream failure(errorPath);
+    failure << error;
+    return 3;
+  }
+  fs::remove(errorPath, fileError);
+  return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   App app(instance);
   fs::path autoInput;
-  const std::wstring command(commandLine ? commandLine : L"");
-  if (command.rfind(L"--stl-test ", 0) == 0) autoInput = command.substr(11);
-  const int result = app.run(autoInput);
+  int argumentCount = 0;
+  LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+  int result = 0;
+  if (arguments && argumentCount == 4 && std::wstring(arguments[1]) == L"--regression") {
+    result = app.runRegression(arguments[2], arguments[3]);
+  } else {
+    const std::wstring command(commandLine ? commandLine : L"");
+    if (command.rfind(L"--stl-test ", 0) == 0) autoInput = command.substr(11);
+    result = app.run(autoInput);
+  }
+  if (arguments) LocalFree(arguments);
   CoUninitialize();
   return result;
 }

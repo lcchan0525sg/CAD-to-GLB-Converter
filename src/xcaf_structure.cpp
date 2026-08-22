@@ -216,6 +216,35 @@ void summarizeComponents(const TDF_Label& assembly, Summary& summary) {
   }
 }
 
+std::wstring resolvedLabelName(const TDF_Label& label, TDF_Label& referred) {
+  std::wstring name = labelName(label);
+  if (XCAFDoc_ShapeTool::GetReferredShape(label, referred) &&
+      isPlaceholderName(name)) {
+    name = labelName(referred);
+  }
+  return name;
+}
+
+void collectAssemblySignature(const TDF_Label& label, bool isComponent,
+                              AssemblySignature& signature) {
+  TDF_Label referred;
+  const std::wstring name = resolvedLabelName(label, referred);
+  if (!isPlaceholderName(name)) signature.meaningfulNames.push_back(name);
+  if (isComponent) ++signature.componentCount;
+
+  const TDF_Label structureLabel = referred.IsNull() ? label : referred;
+  NCollection_Sequence<TDF_Label> components;
+  if (XCAFDoc_ShapeTool::GetComponents(structureLabel, components, false)) {
+    for (Standard_Integer index = 1; index <= components.Length(); ++index) {
+      collectAssemblySignature(components.Value(index), true, signature);
+    }
+    return;
+  }
+  if (isComponent) {
+    ++signature.leafCount;
+  }
+}
+
 }  // namespace
 
 bool isPlaceholderName(const std::wstring& rawName) {
@@ -261,6 +290,21 @@ Summary summarize(const Handle(TDocStd_Document)& document) {
     summarizeComponents(roots.Value(index), summary);
   }
   return summary;
+}
+
+AssemblySignature assemblySignature(const Handle(TDocStd_Document)& document) {
+  AssemblySignature signature;
+  if (document.IsNull()) return signature;
+  const Handle(XCAFDoc_ShapeTool) shapeTool =
+      XCAFDoc_DocumentTool::ShapeTool(document->Main());
+  if (shapeTool.IsNull()) return signature;
+  NCollection_Sequence<TDF_Label> roots;
+  shapeTool->GetFreeShapes(roots);
+  signature.rootCount = static_cast<std::size_t>(roots.Length());
+  for (Standard_Integer index = 1; index <= roots.Length(); ++index) {
+    collectAssemblySignature(roots.Value(index), false, signature);
+  }
+  return signature;
 }
 
 bool renameFallbackGltfNodes(const std::filesystem::path& output, std::string& error) {

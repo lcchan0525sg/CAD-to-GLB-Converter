@@ -4,8 +4,8 @@ project(cad_converter2 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CAD_CONVERTER_VERSION "V0.32" CACHE STRING "Application version label")
-set(CAD_CONVERTER_OUTPUT_SUFFIX "" CACHE STRING "Suffix inserted before converted output extension")
+set(CAD_CONVERTER_VERSION "V0.33D" CACHE STRING "Application version label")
+set(CAD_CONVERTER_OUTPUT_SUFFIX "-D" CACHE STRING "Suffix inserted before converted output extension")
 configure_file(src/version.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/version.hpp" @ONLY)
 
 find_package(OpenCASCADE 8.0.1 REQUIRED
@@ -27,6 +27,7 @@ endif()
 
 add_executable(cad-converter2 WIN32
   src/main.cpp
+  src/gltf_validation.cpp
   src/xcaf_structure.cpp
 )
 add_dependencies(cad-converter2 gltfpack)
@@ -68,6 +69,14 @@ target_link_libraries(iges-structure-test PRIVATE ${OpenCASCADE_LIBRARIES})
 target_compile_definitions(iges-structure-test PRIVATE UNICODE _UNICODE NOMINMAX)
 target_compile_options(iges-structure-test PRIVATE /EHsc)
 
+add_executable(gltf-validation-test EXCLUDE_FROM_ALL
+  bench/gltf_validation_test.cpp
+  src/gltf_validation.cpp
+)
+target_include_directories(gltf-validation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(gltf-validation-test PRIVATE UNICODE _UNICODE NOMINMAX)
+target_compile_options(gltf-validation-test PRIVATE /EHsc)
+
 add_custom_command(TARGET cad-converter2 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${OpenCASCADE_BINARY_DIR}"
@@ -81,6 +90,9 @@ add_custom_command(TARGET cad-converter2 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_CURRENT_SOURCE_DIR}/docs"
     "$<TARGET_FILE_DIR:cad-converter2>/docs"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/CHANGELOG.md"
+    "$<TARGET_FILE_DIR:cad-converter2>/CHANGELOG.md"
 )
 
 if(EXISTS "${DRACO_RUNTIME_DLL}")

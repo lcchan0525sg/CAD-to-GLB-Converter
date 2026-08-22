@@ -52,6 +52,8 @@ int wmain(int argc, wchar_t** argv) {
 
   xcaf_structure::normalizeIgesAssembly(document, L"GearBox");
   const xcaf_structure::Summary summary = xcaf_structure::summarize(document);
+  const xcaf_structure::AssemblySignature signature =
+      xcaf_structure::assemblySignature(document);
 
   const Handle(XCAFDoc_ShapeTool) shapeTool =
       XCAFDoc_DocumentTool::ShapeTool(document->Main());
@@ -69,5 +71,9 @@ int wmain(int argc, wchar_t** argv) {
   if (summary.componentCount != 45) return 11;
   if (summary.namedComponentCount != 45) return 12;
   if (rootName != L"GearBox") return 13;
+  if (signature.rootCount != 1 || signature.componentCount != 45 ||
+      signature.leafCount != 45) return 14;
+  if (signature.meaningfulNames.size() != 1 ||
+      signature.meaningfulNames.front() != L"GearBox") return 15;
   return 0;
 }
