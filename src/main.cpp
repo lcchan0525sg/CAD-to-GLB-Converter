@@ -72,6 +72,7 @@
 #include <string>
 #include <set>
 #include <functional>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -88,6 +89,33 @@ struct ConvertOptions {
   double deflection = 1.0;
   double angular = 1.0;
 };
+
+struct ConversionResult {
+  Handle(TDocStd_Document) document;
+  std::vector<native_stl::Triangle> nativeTriangles;
+  std::uint64_t outputPolygons = 0;
+  std::uint64_t inputPolygons = 0;
+  bool useNativePreview = false;
+};
+
+struct ConversionJob {
+  fs::path input;
+  fs::path output;
+  ConvertOptions options;
+  ConversionResult result;
+  std::string error;
+  bool success = false;
+  double seconds = 0.0;
+};
+
+constexpr LRESULT kCompressionNoneIndex = 0;
+#if CAD_CONVERTER_HAS_DRACO
+constexpr LRESULT kCompressionDracoIndex = 1;
+constexpr LRESULT kCompressionMeshoptIndex = 2;
+#else
+constexpr LRESULT kCompressionDracoIndex = -1;
+constexpr LRESULT kCompressionMeshoptIndex = 1;
+#endif
 
 static double clampDouble(double value, double low, double high, double fallback) {
   if (!std::isfinite(value)) return fallback;
@@ -377,6 +405,7 @@ private:
   void selectInputPath(const fs::path& path);
   void handleDropFiles(HDROP drop);
   void convertSelected();
+  void handleConversionComplete(ConversionJob* job);
   void updateConversionInfo(const fs::path& input, const fs::path& output,
                             const ConvertOptions& options,
                             const Handle(TDocStd_Document)& document,
@@ -384,7 +413,7 @@ private:
                             std::uint64_t inputPolygonOverride = 0);
   ConvertOptions optionsFromControls() const;
   bool convertCad(const fs::path& input, const fs::path& output, const ConvertOptions& options,
-                  std::string& error);
+                  ConversionResult& result, std::string& error);
 
   HINSTANCE instance_{};
   HWND window_{};
@@ -445,11 +474,14 @@ private:
   float nativePreviewPanY_ = 0.0f;
   ULONGLONG nativePreviewLastRenderTick_ = 0;
   bool conversionSucceeded_ = false;
+  bool conversionRunning_ = false;
+  std::thread conversionWorker_;
   bool inputSelected_ = false;
   fs::path selectedInput_;
 };
 
 static App* g_app = nullptr;
+constexpr UINT WM_APP_CONVERSION_COMPLETE = WM_APP + 101;
 
 int App::run(const fs::path& autoInput) {
   g_app = this;
@@ -492,7 +524,7 @@ bool App::createWindow() {
   if (!RegisterClassW(&occtPreviewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
   window_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName,
-                            L"CAD Converter 2 V0.31 - Interactive Preview - OCCT 8.0.1",
+                            L"CAD Converter 2 V0.32 - Interactive Preview - OCCT 8.0.1",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                             1280, 1260, nullptr, nullptr, instance_, nullptr);
   if (!window_) return false;
@@ -530,12 +562,16 @@ void App::createControls() {
     return add(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, width, height, 0);
   };
 
-  headingLabel_ = label(L"CAD Converter 2 V0.31", 44, 24, 500, 34);
+  headingLabel_ = label(L"CAD Converter 2 V0.32", 44, 24, 500, 34);
   SendMessageW(headingLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont_), TRUE);
   helpButton_ = add(0, L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT,
                     848, 28, 72, 30, IDC_MANUAL_HELP);
   SendMessageW(helpButton_, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont_), TRUE);
+#if CAD_CONVERTER_HAS_DRACO
   subtitleLabel_ = label(L"Native CAD conversion with Draco and Meshopt GLB export", 44, 62, 700, 24);
+#else
+  subtitleLabel_ = label(L"Native CAD conversion with Meshopt GLB export", 44, 62, 700, 24);
+#endif
   selectButton_ = add(0, L"BUTTON", L"Drop a CAD file here or click to browse",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                       44, 98, 892, 168, IDC_SELECT);
@@ -568,8 +604,6 @@ void App::createControls() {
   SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"none"));
 #if CAD_CONVERTER_HAS_DRACO
   SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Draco"));
-#else
-  SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Draco (Draco build required)"));
 #endif
   SendMessageW(compressCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Meshopt (STL only)"));
   SendMessageW(compressCombo_, CB_SETCURSEL, 0, 0);
@@ -1345,10 +1379,10 @@ void App::applyProfileValues() {
 void App::updateOptionState() {
   const bool binary = SendMessageW(formatCombo_, CB_GETCURSEL, 0, 0) == 0;
   const LRESULT compression = SendMessageW(compressCombo_, CB_GETCURSEL, 0, 0);
-  const bool draco = compression == 1;
+  const bool draco = compression == kCompressionDracoIndex;
   EnableWindow(compressCombo_, binary);
   EnableWindow(dracoLevelEdit_, binary && draco);
-  if (!binary) SendMessageW(compressCombo_, CB_SETCURSEL, 0, 0);
+  if (!binary) SendMessageW(compressCombo_, CB_SETCURSEL, kCompressionNoneIndex, 0);
   const bool optimize = SendMessageW(optimizeCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
   EnableWindow(deflectionEdit_, optimize);
   EnableWindow(angularEdit_, optimize);
@@ -1586,7 +1620,7 @@ void App::updateConversionInfo(const fs::path& input, const fs::path& output,
 }
 
 bool App::convertCad(const fs::path& input, const fs::path& output, const ConvertOptions& options,
-                     std::string& error) {
+                     ConversionResult& result, std::string& error) {
   const std::string extension = lower(input.extension().string());
   if (options.draco && !CAD_CONVERTER_HAS_DRACO) {
     error = "Draco compression requires the Draco-enabled build";
@@ -1636,8 +1670,10 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
           std::error_code ignored;
           fs::remove(rawOutput, ignored);
         }
-        updateConversionInfo(input, output, options, document, outputPolygons, inputPolygonCount);
-        showNativePreview(triangles);
+        result.outputPolygons = outputPolygons;
+        result.inputPolygons = inputPolygonCount;
+        result.nativeTriangles = std::move(triangles);
+        result.useNativePreview = true;
         return true;
       } catch (const std::exception& exception) {
         error = exception.what();
@@ -1708,8 +1744,7 @@ bool App::convertCad(const fs::path& input, const fs::path& output, const Conver
       !xcaf_structure::renameFallbackGltfNodes(output, error)) {
     return false;
   }
-  updateConversionInfo(input, output, options, document);
-  showPreview(document);
+  result.document = document;
   return true;
 }
 
@@ -1718,8 +1753,8 @@ ConvertOptions App::optionsFromControls() const {
   options.binary = SendMessageW(formatCombo_, CB_GETCURSEL, 0, 0) == 0;
   options.colorsOnly = SendMessageW(appearanceCombo_, CB_GETCURSEL, 0, 0) == 0;
   const LRESULT compression = SendMessageW(compressCombo_, CB_GETCURSEL, 0, 0);
-  options.draco = options.binary && compression == 1;
-  options.meshopt = options.binary && compression == 2;
+  options.draco = options.binary && compression == kCompressionDracoIndex;
+  options.meshopt = options.binary && compression == kCompressionMeshoptIndex;
   options.dracoLevel = static_cast<int>(readDouble(dracoLevelEdit_, 7.0, 0.0, 10.0));
   options.optimize = SendMessageW(optimizeCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
   const LRESULT profile = SendMessageW(profileCombo_, CB_GETCURSEL, 0, 0);
@@ -1739,6 +1774,7 @@ ConvertOptions App::optionsFromControls() const {
 }
 
 void App::convertSelected() {
+  if (conversionRunning_) return;
   if (selectedInput_.empty()) {
     inputSelected_ = false;
     conversionSucceeded_ = false;
@@ -1747,47 +1783,63 @@ void App::convertSelected() {
     setStatus(L"Error: select a STEP, IGES, or STL model first.");
     return;
   }
-  const ConvertOptions options = optionsFromControls();
-  const std::wstring suffix = options.binary ? L".glb" : L".gltf";
-  fs::path output = selectedInput_.parent_path() /
-                    (selectedInput_.stem().wstring() + L"-converted" + suffix);
-  std::string error;
+  auto* job = new ConversionJob();
+  job->input = selectedInput_;
+  job->options = optionsFromControls();
+  const std::wstring suffix = job->options.binary ? L".glb" : L".gltf";
+  job->output = job->input.parent_path() /
+                (job->input.stem().wstring() + L"-converted" + suffix);
   std::wstringstream status;
-  const bool nativeStl = lower(selectedInput_.extension().string()) == ".stl" && options.binary && !options.draco;
+  const bool nativeStl = lower(job->input.extension().string()) == ".stl" &&
+                         job->options.binary && !job->options.draco;
   status << (nativeStl ? L"Converting with native C++ STL pipeline - " : L"Converting with OCCT 8.0.1 - ")
-         << (options.binary ? L"GLB" : L"GLTF")
-         << L" - " << (options.profile == "faithful" ? L"CAD faithful" :
-                         options.profile == "balanced" ? L"Viewer balanced" :
-                         options.profile == "preview" ? L"Fast preview" :
-                         options.profile == "custom" ? L"Custom" : L"Large assembly")
-         << L" - deflection " << options.deflection << L" - angular " << options.angular;
-  if (options.draco) status << L" | Draco " << options.dracoLevel;
-  else if (options.meshopt) status << L" | Meshopt";
+         << (job->options.binary ? L"GLB" : L"GLTF")
+         << L" - " << (job->options.profile == "faithful" ? L"CAD faithful" :
+                        job->options.profile == "balanced" ? L"Viewer balanced" :
+                        job->options.profile == "preview" ? L"Fast preview" :
+                        job->options.profile == "custom" ? L"Custom" : L"Large assembly")
+         << L" - working in background";
   setStatus(status.str());
+  conversionRunning_ = true;
   EnableWindow(convertButton_, FALSE);
-  const auto conversionStart = std::chrono::steady_clock::now();
-  const bool converted = convertCad(selectedInput_, output, options, error);
-  const auto conversionEnd = std::chrono::steady_clock::now();
-  const double processingSeconds = std::chrono::duration<double>(conversionEnd - conversionStart).count();
-  if (!converted) {
+  EnableWindow(selectButton_, FALSE);
+  conversionWorker_ = std::thread([this, job] {
+    const auto start = std::chrono::steady_clock::now();
+    job->success = convertCad(job->input, job->output, job->options, job->result, job->error);
+    job->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (!PostMessageW(window_, WM_APP_CONVERSION_COMPLETE, 0, reinterpret_cast<LPARAM>(job))) {
+      delete job;
+    }
+  });
+}
+
+void App::handleConversionComplete(ConversionJob* job) {
+  if (conversionWorker_.joinable()) conversionWorker_.join();
+  conversionRunning_ = false;
+  EnableWindow(selectButton_, TRUE);
+  EnableWindow(convertButton_, TRUE);
+  if (!job->success) {
     conversionSucceeded_ = false;
     ShowWindow(outputFileLabel_, SW_HIDE);
     ShowWindow(processingTimeLabel_, SW_HIDE);
-    setStatus(L"Error: " + std::wstring(error.begin(), error.end()));
-    EnableWindow(convertButton_, TRUE);
+    setStatus(L"Error: " + std::wstring(job->error.begin(), job->error.end()));
+    delete job;
     return;
   }
   conversionSucceeded_ = true;
-  SetWindowTextW(outputFileLabel_, (L"Output file: " + output.filename().wstring()).c_str());
+  updateConversionInfo(job->input, job->output, job->options, job->result.document,
+                       job->result.outputPolygons, job->result.inputPolygons);
+  if (job->result.useNativePreview) showNativePreview(job->result.nativeTriangles);
+  else showPreview(job->result.document);
+  SetWindowTextW(outputFileLabel_, (L"Output file: " + job->output.filename().wstring()).c_str());
   ShowWindow(outputFileLabel_, SW_SHOW);
   std::wstringstream processing;
   processing << L"Processing time: " << std::fixed << std::setprecision(3)
-             << processingSeconds << L" s";
+             << job->seconds << L" s";
   SetWindowTextW(processingTimeLabel_, processing.str().c_str());
   ShowWindow(processingTimeLabel_, SW_SHOW);
-  std::wstring result = L"Done - " + output.filename().wstring() + L" - ready to preview";
-  setStatus(result);
-  EnableWindow(convertButton_, TRUE);
+  setStatus(L"Done - " + job->output.filename().wstring() + L" - ready to preview");
+  delete job;
 }
 
 LRESULT CALLBACK App::windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1810,10 +1862,22 @@ LRESULT CALLBACK App::windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
       case WM_COMMAND:
         g_app->handleCommand(wParam);
         return 0;
+      case WM_APP_CONVERSION_COMPLETE:
+        g_app->handleConversionComplete(reinterpret_cast<ConversionJob*>(lParam));
+        return 0;
+      case WM_CLOSE:
+        if (g_app->conversionRunning_) {
+          MessageBoxW(hwnd, L"Conversion is still running. Wait for it to finish before closing.",
+                      L"CAD Converter 2", MB_OK | MB_ICONINFORMATION);
+          return 0;
+        }
+        DestroyWindow(hwnd);
+        return 0;
       case WM_SIZE:
         g_app->resizePreview();
         break;
       case WM_DESTROY:
+        if (g_app->conversionWorker_.joinable()) g_app->conversionWorker_.join();
         g_app->releaseThemeResources();
         PostQuitMessage(0);
         return 0;
