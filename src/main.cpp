@@ -645,7 +645,7 @@ bool App::createWindow() {
   if (!RegisterClassW(&occtPreviewClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
 
   window_ = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName,
-                            L"CAD Converter 2 " CAD_CONVERTER_VERSION_TEXT L" - Interactive Preview - OCCT 8.0.1",
+                            L"CAD to GLB Convertor " CAD_CONVERTER_VERSION_TEXT L" - Interactive Preview",
                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                             1280, 1260, nullptr, nullptr, instance_, nullptr);
   if (!window_) return false;
@@ -683,15 +683,15 @@ void App::createControls() {
     return add(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, x, y, width, height, 0);
   };
 
-  headingLabel_ = label(L"CAD Converter 2 " CAD_CONVERTER_VERSION_TEXT, 44, 24, 500, 34);
+  headingLabel_ = label(L"CAD to GLB Convertor " CAD_CONVERTER_VERSION_TEXT, 44, 24, 700, 34);
   SendMessageW(headingLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(headingFont_), TRUE);
   helpButton_ = add(0, L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_FLAT,
                     848, 28, 72, 30, IDC_MANUAL_HELP);
   SendMessageW(helpButton_, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont_), TRUE);
 #if CAD_CONVERTER_HAS_DRACO
-  subtitleLabel_ = label(L"Native CAD conversion with Draco and Meshopt GLB export", 44, 62, 700, 24);
+  subtitleLabel_ = label(L"Convert STEP, IGES, and STL to GLB with Draco or Meshopt compression", 44, 62, 700, 24);
 #else
-  subtitleLabel_ = label(L"Native CAD conversion with Meshopt GLB export", 44, 62, 700, 24);
+  subtitleLabel_ = label(L"Convert STEP, IGES, and STL to GLB with optional Meshopt compression", 44, 62, 700, 24);
 #endif
   selectButton_ = add(0, L"BUTTON", L"Drop a CAD file here or click to browse",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
@@ -1631,14 +1631,14 @@ void App::openHelp() {
   const fs::path manual = executableDirectory() / L"docs" / L"CAD-Converter-2-V0.31-User-Manual.pdf";
   if (!fs::is_regular_file(manual)) {
     MessageBoxW(window_, L"The V0.31 user manual was not found in the docs folder.",
-                L"CAD Converter 2 Help", MB_OK | MB_ICONWARNING);
+                L"CAD to GLB Convertor Help", MB_OK | MB_ICONWARNING);
     return;
   }
   const HINSTANCE result = ShellExecuteW(window_, L"open", manual.c_str(), nullptr,
                                          manual.parent_path().c_str(), SW_SHOWNORMAL);
   if (reinterpret_cast<INT_PTR>(result) <= 32) {
     MessageBoxW(window_, L"Windows could not open the PDF manual.",
-                L"CAD Converter 2 Help", MB_OK | MB_ICONERROR);
+                L"CAD to GLB Convertor Help", MB_OK | MB_ICONERROR);
   }
 }
 

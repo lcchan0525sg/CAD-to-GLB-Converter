@@ -1,0 +1,22 @@
+name: GLB validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validator:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure standalone tests
+        run: cmake -S . -B build-validation -G "Visual Studio 17 2022" -A x64 -DCAD_CONVERTER_VALIDATION_ONLY=ON
+      - name: Build
+        run: cmake --build build-validation --config Release
+      - name: Test
+        run: ctest --test-dir build-validation -C Release --output-on-failure

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Renamed the application to CAD to GLB Convertor in the window, heading, Help dialogs, and launcher.
+- Clarified supported STEP, IGES, and STL inputs in the interface; GLB remains the default output.
+
 ## V0.34D
 
 - Routes STEP and IGES previews through OCCT XCAF so original per-part CAD colors are visible.

@@ -1,4 +1,4 @@
-# CAD Converter 2 validation
+# CAD to GLB Convertor validation
 
 ## Runtime output gate
 
