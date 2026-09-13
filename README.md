@@ -11,9 +11,9 @@ A native Windows desktop application for converting STEP, IGES, and STL models t
 - Use optional Draco compression with a compatible OCCT build, or Meshopt compression for STL.
 - Cancel conversion and save completed results through a native Windows dialog.
 
-![Application preview from the earlier V0.31 release](docs/images/v0.31-gearbox-tree.png)
+![CAD to GLB Convertor V0.34D showing GearBox conversion results and CAD part colors](docs/images/v0.34d-gearbox.png)
 
-The screenshot and bundled V0.31 manual show the previous application name. The current application is named CAD to GLB Convertor.
+The screenshot shows the current V0.34D application. The bundled V0.31 manual retains the previous application name.
 
 ## Run
 
