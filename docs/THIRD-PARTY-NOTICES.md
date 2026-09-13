@@ -43,7 +43,7 @@ The packaged `gltfpack.exe` is built from this source.
 
 ## Draco
 
-Draco compression is optional and is available when the converter is built and packaged with a Draco-enabled OCCT runtime. Draco is not vendored by this source tree in the default build. When a Draco runtime is supplied, its upstream copyright and license notices must remain with that runtime distribution.
+Draco compression is optional and is available when the converter is built and packaged with a Draco-enabled OCCT runtime. The V0.34D portable package uses Draco 1.5.7, copyright the Draco authors, under the Apache License 2.0. The license is included in `docs/licenses/draco-Apache-2.0-LICENSE.txt`. Source: https://github.com/google/draco/tree/1.5.7.
 
 ## Application copyright
 

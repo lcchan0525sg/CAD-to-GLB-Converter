@@ -75,4 +75,4 @@ python scripts/run_regression.py --exe build/Release/cad-converter2.exe --fixtur
 
 ## Copyright and dependencies
 
-Application code and documentation are copyright © 2026 R Innovation. No open-source license has been selected for the application code. Included third-party components retain their respective licenses; see the notices above.
+Application code and documentation are available under the [MIT License](LICENSE). Existing R Innovation copyright notices are retained. Included third-party components retain their respective licenses; see the notices above.
